@@ -57,8 +57,8 @@ jobs:
           kubectl create secret docker-registry ghcr-pull-secret \
             --namespace state-machine \
             --docker-server=ghcr.io \
-            --docker-username=${{ github.actor }} \
-            --docker-password=${{ secrets.GITHUB_TOKEN }}
+            --docker-username=vishvadlamani \
+            --docker-password=${{ secrets.GHCR_TOKEN }}
 
       - name: Update image to new SHA
         run: |
