@@ -9,7 +9,7 @@ env:
   IMAGE_NAME: inventhq/state-machine
 
 jobs:
-  build-and-push:
+  build-and-deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -34,17 +34,6 @@ jobs:
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-
-  deploy:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
@@ -76,6 +65,10 @@ jobs:
           kubectl set image deployment/state-machine \
             state-machine=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
             -n state-machine
+
+      - name: Restart pods to pick up new pull secret
+        run: |
+          kubectl rollout restart deployment/state-machine -n state-machine
 
       - name: Wait for rollout
         run: |
