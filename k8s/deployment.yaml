@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: state-machine
+  namespace: state-machine
+  labels:
+    app: state-machine
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: state-machine
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: state-machine
+    spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
+      containers:
+        - name: state-machine
+          image: ghcr.io/inventhq/state-machine:latest
+          ports:
+            - containerPort: 3051
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:3051"
+            - name: RUST_LOG
+              value: "info"
+            - name: TIMEOUT_INTERVAL_SECS
+              value: "10"
+            - name: TURSO_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: state-machine-secrets
+                  key: TURSO_DATABASE_URL
+            - name: TURSO_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: state-machine-secrets
+                  key: TURSO_AUTH_TOKEN
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: state-machine-secrets
+                  key: API_KEY
+            - name: EVENT_CORE_INGEST_URL
+              valueFrom:
+                secretKeyRef:
+                  name: state-machine-secrets
+                  key: EVENT_CORE_INGEST_URL
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3051
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

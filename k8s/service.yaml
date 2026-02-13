@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: state-machine
+  namespace: state-machine
+  labels:
+    app: state-machine
+spec:
+  type: ClusterIP
+  selector:
+    app: state-machine
+  ports:
+    - port: 3051
+      targetPort: 3051
+      protocol: TCP
+      name: http

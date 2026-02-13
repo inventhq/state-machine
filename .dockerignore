@@ -1,0 +1,9 @@
+target/
+.data/
+.env
+*.db
+*.db-wal
+*.db-shm
+.git/
+.github/
+k8s/
