@@ -1,7 +1,11 @@
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM rust:1.85-slim-bookworm AS builder
+FROM debian:bookworm-slim AS builder
 
-RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl build-essential pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+# Install Rust 1.88 (required by home@0.5.12 transitive dep)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0
+ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
