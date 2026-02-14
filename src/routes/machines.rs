@@ -24,6 +24,7 @@ pub async fn create_machine(
         joins: req.joins,
         transitions: req.transitions,
         actions: req.actions,
+        sub_machines: req.sub_machines,
     };
 
     machine.validate().map_err(AppError::BadRequest)?;
@@ -106,6 +107,7 @@ pub async fn update_machine(
     machine.joins = req.joins;
     machine.transitions = req.transitions;
     machine.actions = req.actions;
+    machine.sub_machines = req.sub_machines;
 
     machine.validate().map_err(AppError::BadRequest)?;
 

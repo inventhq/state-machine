@@ -24,6 +24,9 @@ pub struct MachineDefinition {
     pub transitions: Vec<TransitionDef>,
     #[serde(default)]
     pub actions: Vec<ActionDef>,
+    /// Sub-machines for compound states (flat FSMs). Parallel machines use RegionDef.sub_machines.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub sub_machines: HashMap<String, SubMachineDef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +123,18 @@ impl MachineDefinition {
         }
     }
 
+    /// Look up a sub-machine definition for a state in a given region.
+    pub fn sub_machine_for_state(&self, state: &str, region: &str) -> Option<&SubMachineDef> {
+        if self.is_parallel() {
+            self.regions
+                .iter()
+                .find(|r| r.id == region)
+                .and_then(|r| r.sub_machines.get(state))
+        } else {
+            self.sub_machines.get(state)
+        }
+    }
+
     fn validate_flat(&self) -> Result<(), String> {
         if self.states.is_empty() {
             return Err("at least one state is required".into());
@@ -147,6 +162,26 @@ impl MachineDefinition {
                     "action on_enter state '{}' not in states",
                     a.on_enter
                 ));
+            }
+        }
+        // Validate sub-machine references
+        for (state, sub) in &self.sub_machines {
+            if !self.states.contains(state) {
+                return Err(format!("sub_machine state '{}' not in states list", state));
+            }
+            if state == &self.initial_state {
+                return Err(format!(
+                    "initial_state '{}' cannot be a compound state (sub-machine)",
+                    state
+                ));
+            }
+            for (_final_state, target) in &sub.on_final {
+                if !self.states.contains(target) {
+                    return Err(format!(
+                        "sub_machine on_final target '{}' not in states list",
+                        target
+                    ));
+                }
             }
         }
         Ok(())
@@ -378,6 +413,21 @@ pub struct TransitionResponse {
     pub timestamp: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_machine: Option<SubMachineTransition>,
+}
+
+/// Sub-machine transition detail returned when an event is forwarded to a child machine.
+#[derive(Debug, Clone, Serialize)]
+pub struct SubMachineTransition {
+    pub machine_id: String,
+    pub entity_id: String,
+    pub previous_state: serde_json::Value,
+    pub current_state: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transition: Option<String>,
+    /// True when the child reached a final state and the parent auto-advanced.
+    pub auto_completed: bool,
 }
 
 /// Structured action object returned in transition responses.
@@ -450,6 +500,8 @@ pub struct CreateMachineRequest {
     pub transitions: Vec<TransitionDef>,
     #[serde(default)]
     pub actions: Vec<ActionDef>,
+    #[serde(default)]
+    pub sub_machines: HashMap<String, SubMachineDef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -465,4 +517,6 @@ pub struct UpdateMachineRequest {
     pub transitions: Vec<TransitionDef>,
     #[serde(default)]
     pub actions: Vec<ActionDef>,
+    #[serde(default)]
+    pub sub_machines: HashMap<String, SubMachineDef>,
 }

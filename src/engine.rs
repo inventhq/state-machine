@@ -276,6 +276,7 @@ mod tests {
                 },
             ],
             actions: vec![],
+            sub_machines: HashMap::new(),
         }
     }
 
@@ -351,6 +352,7 @@ mod tests {
                 },
             ],
             actions: vec![],
+            sub_machines: HashMap::new(),
         }
     }
 
