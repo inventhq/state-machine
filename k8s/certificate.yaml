@@ -1,0 +1,12 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: smachine-juicyapi-tls
+  namespace: state-machine
+spec:
+  secretName: smachine-juicyapi-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - "smachine.juicyapi.com"

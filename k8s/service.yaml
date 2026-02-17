@@ -10,7 +10,7 @@ spec:
   selector:
     app: state-machine
   ports:
-    - port: 3051
+    - port: 80
       targetPort: 3051
       protocol: TCP
       name: http

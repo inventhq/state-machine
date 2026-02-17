@@ -18,6 +18,7 @@ pub fn dispatch_actions(
     entity_id: &str,
     from_state: &str,
     to_state: &str,
+    ingest_token: Option<&str>,
 ) -> Vec<DispatchedAction> {
     let mut dispatched = Vec::new();
 
@@ -50,18 +51,19 @@ pub fn dispatch_actions(
                 });
                 let client = client.clone();
                 let ingest_url = event_core_url.to_string();
+                let token = ingest_token.map(|t| t.to_string());
                 let payload = json!({
                     "event_type": event_type,
                     "params": {
-                        "key_prefix": tenant_id,
                         "machine_id": machine_id,
                         "entity_id": entity_id,
                         "from_state": from_state,
                         "to_state": to_state,
-                    }
+                    },
+                    "raw_payload": null
                 });
                 tokio::spawn(async move {
-                    dispatch_webhook_with_retry(&client, &ingest_url, &payload, 3).await;
+                    dispatch_event_with_retry(&client, &ingest_url, &payload, token.as_deref(), 3).await;
                 });
             }
         }
@@ -149,4 +151,48 @@ async fn dispatch_webhook_with_retry(
         }
     }
     error!("Action dispatch to {} exhausted all retries", url);
+}
+
+/// Dispatch event to tracker with Bearer ingest token auth and retry.
+async fn dispatch_event_with_retry(
+    client: &Client,
+    url: &str,
+    payload: &serde_json::Value,
+    ingest_token: Option<&str>,
+    max_retries: u32,
+) {
+    for attempt in 0..=max_retries {
+        let mut req = client.post(url).json(payload);
+        if let Some(token) = ingest_token {
+            req = req.header("Authorization", format!("Bearer {}", token));
+        }
+        match req.send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    info!("Event dispatched to {} (attempt {})", url, attempt + 1);
+                    return;
+                }
+                warn!(
+                    "Event dispatch to {} returned {}, attempt {}/{}",
+                    url,
+                    resp.status(),
+                    attempt + 1,
+                    max_retries + 1
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "Event dispatch to {} failed: {}, attempt {}/{}",
+                    url,
+                    e,
+                    attempt + 1,
+                    max_retries + 1
+                );
+            }
+        }
+        if attempt < max_retries {
+            tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
+        }
+    }
+    error!("Event dispatch to {} exhausted all retries", url);
 }

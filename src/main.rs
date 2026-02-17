@@ -13,6 +13,7 @@ mod engine;
 mod errors;
 mod models;
 mod routes;
+mod ingest_tokens;
 mod scheduler;
 mod transition_core;
 
@@ -36,6 +37,9 @@ async fn main() {
     let event_core_ingest_url =
         std::env::var("EVENT_CORE_INGEST_URL").unwrap_or_else(|_| "http://localhost:3030/ingest".to_string());
     let api_key = std::env::var("API_KEY").unwrap_or_default();
+    let platform_api_url =
+        std::env::var("PLATFORM_API_URL").unwrap_or_else(|_| "https://api.juicyapi.com".to_string());
+    let platform_api_key = std::env::var("PLATFORM_API_KEY").unwrap_or_default();
     let timeout_interval_secs: u64 = std::env::var("TIMEOUT_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -64,11 +68,16 @@ async fn main() {
 
     let machine_cache = std::sync::Arc::new(dashmap::DashMap::new());
 
+    let ingest_token_cache = std::sync::Arc::new(dashmap::DashMap::new());
+
     let state = AppState {
         db,
         http_client,
         event_core_ingest_url,
         machine_cache,
+        platform_api_url,
+        platform_api_key,
+        ingest_token_cache,
     };
 
     // API routes (auth-protected)
