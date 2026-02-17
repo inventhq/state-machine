@@ -4,72 +4,65 @@ on:
   push:
     branches: [main]
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: inventhq/state-machine
-
 jobs:
-  build-and-deploy:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ghcr.io/inventhq/state-machine:latest
+            ghcr.io/inventhq/state-machine:${{ github.sha }}
 
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
 
-      - name: Configure kubeconfig
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set kubeconfig
         run: |
           mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+          echo "${{ secrets.CIVO_KUBECONFIG }}" | base64 -d > $HOME/.kube/config
 
-      - name: Apply K8s manifests
+      - name: Create/update GHCR pull secret
         run: |
-          kubectl apply -f k8s/namespace.yaml
-          kubectl apply -f k8s/deployment.yaml
-          kubectl apply -f k8s/service.yaml
-          kubectl apply -f k8s/ingress.yaml
-          kubectl apply -f k8s/hpa.yaml
-
-      - name: Ensure GHCR pull secret
-        run: |
-          kubectl delete secret ghcr-pull-secret -n state-machine --ignore-not-found
-          kubectl create secret docker-registry ghcr-pull-secret \
-            --namespace state-machine \
+          kubectl -n state-machine delete secret ghcr-pull-secret --ignore-not-found
+          kubectl -n state-machine create secret docker-registry ghcr-pull-secret \
             --docker-server=ghcr.io \
-            --docker-username=vishvadlamani \
-            --docker-password=${{ secrets.GHCR_TOKEN }}
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GHCR_PAT }}
 
-      - name: Update image to new SHA
+      - name: Create/update app secrets
         run: |
-          kubectl set image deployment/state-machine \
-            state-machine=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
-            -n state-machine
+          kubectl -n state-machine delete secret state-machine-secrets --ignore-not-found
+          kubectl -n state-machine create secret generic state-machine-secrets \
+            --from-literal=TURSO_DATABASE_URL="${{ secrets.TURSO_DATABASE_URL }}" \
+            --from-literal=TURSO_AUTH_TOKEN="${{ secrets.TURSO_AUTH_TOKEN }}" \
+            --from-literal=API_KEY="${{ secrets.API_KEY }}" \
+            --from-literal=EVENT_CORE_INGEST_URL="${{ secrets.EVENT_CORE_INGEST_URL }}" \
+            --from-literal=PLATFORM_API_URL="${{ secrets.PLATFORM_API_URL }}" \
+            --from-literal=PLATFORM_API_KEY="${{ secrets.PLATFORM_API_KEY }}"
 
-      - name: Restart pods to pick up new pull secret
-        run: |
-          kubectl rollout restart deployment/state-machine -n state-machine
+      - name: Apply manifests
+        run: kubectl apply -f k8s/
 
       - name: Wait for rollout
-        run: |
-          kubectl rollout status deployment/state-machine -n state-machine --timeout=180s
+        run: kubectl -n state-machine rollout status deployment/state-machine --timeout=300s
