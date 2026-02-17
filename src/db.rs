@@ -121,5 +121,16 @@ async fn migrate(conn: &Connection) -> Result<(), libsql::Error> {
         )
         .await;
 
+    // Migration: ingest tokens table (per-tenant tracker auth)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS ingest_tokens (
+            tenant_id TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )",
+        (),
+    )
+    .await?;
+
     Ok(())
 }

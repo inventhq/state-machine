@@ -4,10 +4,15 @@ metadata:
   name: state-machine
   namespace: state-machine
   annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: web
+    cert-manager.io/cluster-issuer: letsencrypt-prod
 spec:
+  tls:
+    - hosts:
+        - smachine.juicyapi.com
+      secretName: smachine-juicyapi-tls
   rules:
-    - http:
+    - host: smachine.juicyapi.com
+      http:
         paths:
           - path: /
             pathType: Prefix
@@ -15,4 +20,4 @@ spec:
               service:
                 name: state-machine
                 port:
-                  number: 3051
+                  number: 80

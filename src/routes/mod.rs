@@ -19,6 +19,12 @@ pub struct AppState {
     /// In-memory cache: (tenant_id, machine_id) → MachineDefinition
     /// Eliminates DB reads on the hot path for machine lookups.
     pub machine_cache: Arc<DashMap<(String, String), MachineDefinition>>,
+    /// Platform API URL for provisioning ingest tokens
+    pub platform_api_url: String,
+    /// Platform API key for internal calls
+    pub platform_api_key: String,
+    /// In-memory cache: tenant_id → ingest token (pt_...)
+    pub ingest_token_cache: Arc<DashMap<String, String>>,
 }
 
 /// Extract tenant_id from the X-Tenant-Id header.

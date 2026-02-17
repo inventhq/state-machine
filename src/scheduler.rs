@@ -162,6 +162,9 @@ async fn tick(
                 let action_configs: Vec<(String, ActionConfig, Option<String>)> =
                     actions::collect_actions_for_state(&machine.actions, to_state, region_opt);
 
+                // Look up ingest token for this tenant
+                let ingest_token = lookup_ingest_token(&conn, &machine.tenant_id).await;
+
                 let dispatched = actions::dispatch_actions(
                     http_client,
                     event_core_ingest_url,
@@ -171,6 +174,7 @@ async fn tick(
                     &entity_id,
                     &from_state,
                     to_state,
+                    ingest_token.as_deref(),
                 );
 
                 let dispatched_json = serde_json::to_string(&dispatched).unwrap_or_default();
@@ -209,6 +213,19 @@ async fn tick(
     }
 
     Ok(())
+}
+
+/// Look up an ingest token for a tenant from the DB.
+async fn lookup_ingest_token(conn: &libsql::Connection, tenant_id: &str) -> Option<String> {
+    let mut rows = conn
+        .query(
+            "SELECT token FROM ingest_tokens WHERE tenant_id = ?1",
+            libsql::params![tenant_id.to_string()],
+        )
+        .await
+        .ok()?;
+    let row = rows.next().await.ok()??;
+    row.get::<String>(0).ok()
 }
 
 fn extract_timeout_ms(guard: &Option<serde_json::Value>) -> Option<i64> {

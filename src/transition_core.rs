@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::actions;
 use crate::engine;
 use crate::errors::AppError;
+use crate::ingest_tokens;
 use crate::models::*;
 use crate::routes::entities::load_entity;
 use crate::routes::machines::load_machine;
@@ -114,6 +115,7 @@ pub async fn execute_transition(
             // Build structured action list (always returned in response).
             // Only fire server-side if dispatch=true (default for non-plugin-runtime callers).
             let dispatched = if dispatch {
+                let token = ingest_tokens::get_or_create(state, tenant_id).await;
                 actions::dispatch_actions(
                     &state.http_client,
                     &state.event_core_ingest_url,
@@ -123,6 +125,7 @@ pub async fn execute_transition(
                     entity_id,
                     &tr.from_state,
                     &tr.to_state,
+                    token.as_deref(),
                 )
             } else {
                 actions::build_action_list(all_action_configs)
@@ -491,10 +494,12 @@ async fn advance_parent_state(
     }
 
     let dispatched = if dispatch {
+        let token = ingest_tokens::get_or_create(state, tenant_id).await;
         actions::dispatch_actions(
             &state.http_client, &state.event_core_ingest_url,
             all_action_configs, tenant_id, &machine.machine_id,
             &entity.entity_id, from_state, to_state,
+            token.as_deref(),
         )
     } else {
         actions::build_action_list(all_action_configs)
