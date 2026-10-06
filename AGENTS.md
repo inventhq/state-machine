@@ -60,20 +60,25 @@ HTTP POST /api/machines/{id}/evaluate
   → evaluate handler (routes/evaluate.rs)
     → load_machine() from DashMap cache or DB
     → load_or_create_entity() — auto-creates in initial state if missing
-    → transition_core::execute_transition()
-      → dedup check (SELECT from transitions by event+timestamp)
+    → transition_core::execute_transition() — one BEGIN IMMEDIATE transaction
+      → re-read entity inside the transaction
+      → dedup check (rows with same event_type+timestamp; equal params = duplicate,
+        different params = 409 EVENT_IDENTITY_CONFLICT)
       → engine::evaluate() — pure CPU, finds matching transition + checks guards
       → IF match found:
         → update state_map, apply joins, encode new state
-        → collect + dispatch actions
-        → optimistic lock UPDATE (state_version check)
-        → record transition history
+        → collect actions (not fired yet)
+        → insert history row + $join rows (identity_key, cause)
+        → guarded UPDATE of state, context, version, region_entries
       → IF no match:
         → try_sub_machine_forward() — check if current state is a compound state
-          → load child machine, load/create child entity
-          → recursively call execute_transition on child
-          → if child completed (final state) → advance_parent_state()
+          → load child machine, load/create child entity (same transaction)
+          → recursively call transition_in_tx on child
+          → if child completed (final state) → advance_parent_state() (same transaction)
+          → if child already final → recovery advance only if correlated
+            (else 409 UNCORRELATED_CHILD_FINAL)
         → if still no match → return "no transition" response
+      → COMMIT, then (dispatch=true) ingest token + action dispatch
     ← TransitionResponse JSON
 ```
 
@@ -101,6 +106,16 @@ UPDATE entities SET ... WHERE state_version = ?
 ```
 
 If `affected == 0`, another transition won the race → return `409 Conflict`.
+Every writer runs in a `BEGIN IMMEDIATE` transaction (E1), so this guard is not expected to
+trip; contention surfaces as `500 database is locked` with nothing applied.
+
+### Region Entry Instances and Identity (E1–E4)
+
+See `docs/E1_E4_CONTRACT.md` (`statemachine-e1e4.v1`). `entities.region_entries` records each
+region's current entry instance (`seq`, `entered_at`, creating history row); the scheduler times
+out a region from its own entry. History rows carry `identity_key` and `cause`. Region names are
+never interpolated into SQL (`json_each` with bound parameters). Pure helpers live in `engine.rs`
+(`effective_region_entries`, `advance_region_entries`, `*_identity`).
 
 ### Sub-Machine Convention
 
@@ -148,13 +163,15 @@ If `affected == 0`, another transition won the race → return `409 Conflict`.
 
 ### Unit Tests
 
-All unit tests are in `src/engine.rs` under `#[cfg(test)] mod tests`. They test the pure evaluation engine (no DB required).
+Pure unit tests are in `src/engine.rs` under `#[cfg(test)] mod tests` (no DB required).
+DB-backed E1–E4 tests are in `src/e1e4_tests.rs`: each uses a disposable SQLite file and an
+in-process loopback HTTP sink, and injects failures with SQLite triggers on that file.
 
 ```bash
 cargo test
 ```
 
-Current tests (9):
+Original engine tests (9):
 - `test_simple_transition` — basic flat FSM transition
 - `test_no_valid_transition` — event with no matching transition
 - `test_guard_passes` / `test_guard_fails` — guard condition evaluation
@@ -163,6 +180,13 @@ Current tests (9):
 - `test_join_fires_when_all_satisfied` — join barrier fires
 - `test_join_not_satisfied` — join doesn't fire when conditions not met
 - `test_join_does_not_refire` — join idempotency
+
+E1–E4 tests (28): 9 pure helper tests in `engine.rs` (identity keys, params equality, entry
+instances, legacy derivation, region validation) and 19 DB-backed tests in `e1e4_tests.rs`
+(rollback on history/join/update/`$sub_complete`/`$timeout` faults with zero outbound requests,
+exact replay vs identity conflict, concurrent duplicates and ticks, old-schema startup with
+legacy duplicates, region timer independence/re-entry/legacy/stale entries, timeout+join receipt,
+child timeout → parent recovery provenance, uncorrelated/stale child final, bound region queries).
 
 ### E2E Testing
 

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const DEFAULT_REGION: &str = "_";
 
@@ -191,9 +191,15 @@ impl MachineDefinition {
         let region_map: HashMap<&str, &RegionDef> =
             self.regions.iter().map(|r| (r.id.as_str(), r)).collect();
 
+        // Region ids are never interpolated into SQL (they are bound parameters), so any
+        // non-empty name is accepted. Duplicates are rejected: they collapse in the state map.
+        let mut seen_regions = HashSet::new();
         for r in &self.regions {
             if r.id.is_empty() {
                 return Err("region id is required".into());
+            }
+            if !seen_regions.insert(r.id.as_str()) {
+                return Err(format!("duplicate region id '{}'", r.id));
             }
             if r.states.is_empty() {
                 return Err(format!("region '{}' must have at least one state", r.id));
@@ -203,6 +209,22 @@ impl MachineDefinition {
                     "region '{}' initial_state '{}' not in its states",
                     r.id, r.initial_state
                 ));
+            }
+            for (state, sub) in &r.sub_machines {
+                if !r.states.contains(state) {
+                    return Err(format!(
+                        "region '{}' sub_machine state '{}' not in its states",
+                        r.id, state
+                    ));
+                }
+                for target in sub.on_final.values() {
+                    if !r.states.contains(target) {
+                        return Err(format!(
+                            "region '{}' sub_machine on_final target '{}' not in its states",
+                            r.id, target
+                        ));
+                    }
+                }
             }
         }
 
@@ -271,6 +293,51 @@ pub struct Entity {
     pub state_version: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Persisted per-region entry instances (`entities.region_entries`). `None` for rows
+    /// written before E2 or by a writer that does not maintain it.
+    #[serde(default)]
+    pub region_entries: Option<StoredRegionEntries>,
+}
+
+// ── Region entry instances (E2) ─────────────────────────────────────────────
+
+/// How a region entry's `entered_at` was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryBasis {
+    /// Entered at entity creation.
+    Created,
+    /// Entered by a committed engine write (`row`/`key` identify its history row).
+    Transition,
+    /// Flat entity written without entry tracking: every write re-enters its only region,
+    /// so `updated_at` is exact.
+    LegacyExact,
+    /// Parallel region written without entry tracking: `updated_at` is only an upper bound
+    /// of the true entry time, so a timer never fires early (it may fire late).
+    LegacyUpperBound,
+}
+
+/// One region's current state-entry instance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegionEntry {
+    pub state: String,
+    /// `state_version` produced by the write that entered this instance (1 at creation).
+    pub seq: i64,
+    /// Server time (ms) of that write (an upper bound for `legacy_upper_bound`).
+    pub entered_at: i64,
+    pub basis: EntryBasis,
+    /// History row id that entered this instance, if any.
+    pub row: Option<i64>,
+    /// `identity_key` of that history row, if any.
+    pub key: Option<String>,
+}
+
+/// The persisted `entities.region_entries` document. Valid only while `version` equals the
+/// row's `state_version`; otherwise a writer without entry tracking changed the row.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StoredRegionEntries {
+    pub version: i64,
+    pub regions: BTreeMap<String, RegionEntry>,
 }
 
 impl Entity {
@@ -329,6 +396,7 @@ impl Entity {
             state_version: self.state_version,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            region_entries: crate::engine::effective_region_entries(self),
         }
     }
 }
@@ -357,6 +425,8 @@ pub struct EntityResponse {
     pub state_version: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// Current entry instance of every region ("_" for flat machines).
+    pub region_entries: BTreeMap<String, RegionEntry>,
 }
 
 // ── Transition Record (audit log) ───────────────────────────────────────────
@@ -378,6 +448,12 @@ pub struct TransitionRecord {
     pub region: Option<String>,
     pub timestamp: i64,
     pub created_at: i64,
+    /// Semantic identity of this row (`null` for rows written before E1).
+    #[serde(default)]
+    pub identity_key: Option<String>,
+    /// Provenance for `$timeout`, `$sub_complete` and `$join` rows.
+    #[serde(default)]
+    pub cause: Option<serde_json::Value>,
 }
 
 // ── API Request / Response Types ────────────────────────────────────────────

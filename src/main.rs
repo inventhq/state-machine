@@ -17,6 +17,9 @@ mod ingest_tokens;
 mod scheduler;
 mod transition_core;
 
+#[cfg(test)]
+mod e1e4_tests;
+
 use routes::AppState;
 
 #[tokio::main]

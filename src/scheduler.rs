@@ -1,13 +1,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use libsql::Database;
+use libsql::{Database, TransactionBehavior};
 use reqwest::Client;
 use tracing::{error, info, warn};
 
 use crate::actions;
-use crate::models::{ActionConfig, MachineDefinition, TransitionDef, DEFAULT_REGION};
+use crate::engine::{self, RegionEntered};
+use crate::errors::AppError;
+use crate::models::{ActionConfig, Entity, MachineDefinition, TransitionDef, DEFAULT_REGION};
+use crate::routes::entities::{load_entity_on, region_state_predicate};
 use crate::routes::now_millis;
+use crate::transition_core::{insert_history, insert_join_rows, update_entity, HistoryRow};
 
 /// Start the background timeout scheduler.
 /// Polls every `interval` seconds for entities that have exceeded their timeout guard
@@ -22,7 +26,7 @@ pub fn start(
         let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
         loop {
             ticker.tick().await;
-            if let Err(e) = tick(&db, &http_client, &event_core_ingest_url).await {
+            if let Err(e) = tick(&db, &http_client, &event_core_ingest_url, now_millis()).await {
                 error!("Timeout scheduler error: {}", e);
             }
         }
@@ -33,27 +37,29 @@ pub fn start(
     );
 }
 
-async fn tick(
+/// Outcome counts of one tick.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TickReport {
+    pub fired: usize,
+    pub errors: usize,
+}
+
+/// One scheduler pass at `now`.
+///
+/// Eligibility (E2): a region's `$timeout` from `from` is due when that region is in `from` and
+/// its own entry instance satisfies `entered_at + timeout_ms <= now`; other regions' writes do
+/// not move it. Each candidate fires in its own IMMEDIATE transaction (E1) that re-reads and
+/// re-checks the entity and writes state, region entries, the `$timeout` row (identity
+/// `["timeout", region, seq]`, E3) and any `$join` rows. A failing candidate is logged and
+/// skipped. Actions are dispatched only after commit.
+pub(crate) async fn tick(
     db: &Database,
     http_client: &Client,
     event_core_ingest_url: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let conn = db.connect()?;
-
-    // Load all machine definitions
-    let mut rows = conn
-        .query("SELECT definition FROM machines", ())
-        .await?;
-
-    let mut machines: Vec<MachineDefinition> = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let def_str: String = row.get(0)?;
-        if let Ok(m) = serde_json::from_str::<MachineDefinition>(&def_str) {
-            machines.push(m);
-        }
-    }
-
-    let now = now_millis();
+    now: i64,
+) -> Result<TickReport, Box<dyn std::error::Error + Send + Sync>> {
+    let machines = load_machines(db).await?;
+    let mut report = TickReport::default();
 
     for machine in &machines {
         // Find transitions with $timeout trigger + timeout_seconds guard
@@ -62,10 +68,6 @@ async fn tick(
             .iter()
             .filter(|t| t.on == "$timeout")
             .collect();
-
-        if timeout_transitions.is_empty() {
-            continue;
-        }
 
         for tt in &timeout_transitions {
             let timeout_ms = match extract_timeout_ms(&tt.guard) {
@@ -78,145 +80,265 @@ async fn tick(
                     continue;
                 }
             };
-
-            let cutoff = now - timeout_ms;
             let region = tt.region.as_deref().unwrap_or(DEFAULT_REGION);
-            let is_parallel = machine.is_parallel();
 
-            // Find entities in the `from` state whose updated_at is older than cutoff
-            // For flat: current_state = from. For parallel: json_extract(current_state, '$.region') = from
-            let mut entity_rows = if is_parallel {
-                conn.query(
-                    &format!(
-                        "SELECT entity_id, current_state, context, state_version, updated_at FROM entities WHERE tenant_id = ?1 AND machine_id = ?2 AND json_extract(current_state, '$.{}') = ?3 AND updated_at <= ?4",
-                        region
-                    ),
-                    libsql::params![
-                        machine.tenant_id.clone(),
-                        machine.machine_id.clone(),
-                        tt.from.clone(),
-                        cutoff
-                    ],
-                )
-                .await?
-            } else {
-                conn.query(
-                    "SELECT entity_id, current_state, context, state_version, updated_at FROM entities WHERE tenant_id = ?1 AND machine_id = ?2 AND current_state = ?3 AND updated_at <= ?4",
-                    libsql::params![
-                        machine.tenant_id.clone(),
-                        machine.machine_id.clone(),
-                        tt.from.clone(),
-                        cutoff
-                    ],
-                )
-                .await?
-            };
-
-            while let Some(row) = entity_rows.next().await? {
-                let entity_id: String = row.get(0)?;
-                let current_state_raw: String = row.get(1)?;
-                let context_str: String = row.get::<String>(2).unwrap_or_else(|_| "{}".to_string());
-                let state_version: i64 = row.get(3)?;
-
-                let to_state = &tt.to;
-
-                // Build new state
-                let new_state = if is_parallel {
-                    let mut state_map: std::collections::HashMap<String, String> =
-                        serde_json::from_str(&current_state_raw).unwrap_or_default();
-                    let from_state = state_map.get(region).cloned().unwrap_or_default();
-                    state_map.insert(region.to_string(), to_state.clone());
-
-                    // Check joins after timeout transition
-                    let _joins = crate::engine::apply_joins(&machine, &mut state_map, 10);
-
-                    let new_encoded = crate::models::Entity::encode_state(&state_map);
-                    (new_encoded, from_state)
-                } else {
-                    (to_state.clone(), current_state_raw.clone())
+            let candidates =
+                match timeout_candidates(db, machine, region, &tt.from, now - timeout_ms).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        error!(
+                            "Timeout scheduler: candidate query failed for {}/{} region '{}': {}",
+                            machine.tenant_id, machine.machine_id, region, e
+                        );
+                        report.errors += 1;
+                        continue;
+                    }
                 };
 
-                let (new_state_encoded, from_state) = new_state;
-
-                // Optimistic locking: only transition if version matches
-                let affected = conn
-                    .execute(
-                        "UPDATE entities SET current_state = ?1, state_version = state_version + 1, updated_at = ?2 WHERE tenant_id = ?3 AND machine_id = ?4 AND entity_id = ?5 AND state_version = ?6",
-                        libsql::params![
-                            new_state_encoded,
-                            now,
-                            machine.tenant_id.clone(),
-                            machine.machine_id.clone(),
-                            entity_id.clone(),
-                            state_version
-                        ],
-                    )
-                    .await?;
-
-                if affected == 0 {
-                    continue; // Another transition won the race
+            for entity_id in candidates {
+                match fire_timeout(db, machine, tt, region, &entity_id, timeout_ms, now).await {
+                    Ok(Some(fired)) => {
+                        report.fired += 1;
+                        // Network only after the commit above.
+                        let ingest_token = lookup_ingest_token(db, &machine.tenant_id).await;
+                        actions::dispatch_actions(
+                            http_client,
+                            event_core_ingest_url,
+                            fired.action_configs,
+                            &machine.tenant_id,
+                            &machine.machine_id,
+                            &entity_id,
+                            &fired.from_state,
+                            &tt.to,
+                            ingest_token.as_deref(),
+                        );
+                        info!(
+                            "Timeout transition: {}/{} {}:{} → {} (after {}s)",
+                            machine.machine_id,
+                            entity_id,
+                            region,
+                            fired.from_state,
+                            tt.to,
+                            timeout_ms / 1000
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        error!(
+                            "Timeout scheduler: {}/{} region '{}' not fired: {}",
+                            machine.machine_id, entity_id, region, e
+                        );
+                        report.errors += 1;
+                    }
                 }
-
-                // Collect and dispatch actions
-                let region_opt = if is_parallel { Some(region) } else { None };
-                let action_configs: Vec<(String, ActionConfig, Option<String>)> =
-                    actions::collect_actions_for_state(&machine.actions, to_state, region_opt);
-
-                // Look up ingest token for this tenant
-                let ingest_token = lookup_ingest_token(&conn, &machine.tenant_id).await;
-
-                let dispatched = actions::dispatch_actions(
-                    http_client,
-                    event_core_ingest_url,
-                    action_configs,
-                    &machine.tenant_id,
-                    &machine.machine_id,
-                    &entity_id,
-                    &from_state,
-                    to_state,
-                    ingest_token.as_deref(),
-                );
-
-                let dispatched_json = serde_json::to_string(&dispatched).unwrap_or_default();
-                let region_str = if is_parallel { region } else { "" };
-
-                // Record transition history
-                conn.execute(
-                    "INSERT INTO transitions (tenant_id, machine_id, entity_id, from_state, to_state, event_type, event_params, actions_dispatched, region, timestamp, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                    libsql::params![
-                        machine.tenant_id.clone(),
-                        machine.machine_id.clone(),
-                        entity_id.clone(),
-                        from_state.clone(),
-                        to_state.clone(),
-                        "$timeout".to_string(),
-                        context_str,
-                        dispatched_json,
-                        region_str.to_string(),
-                        now,
-                        now
-                    ],
-                )
-                .await?;
-
-                info!(
-                    "Timeout transition: {}/{} {}:{} → {} (after {}s)",
-                    machine.machine_id,
-                    entity_id,
-                    region,
-                    from_state,
-                    to_state,
-                    timeout_ms / 1000
-                );
             }
         }
     }
 
-    Ok(())
+    Ok(report)
+}
+
+async fn load_machines(
+    db: &Database,
+) -> Result<Vec<MachineDefinition>, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = db.connect()?;
+    let mut rows = conn.query("SELECT definition FROM machines", ()).await?;
+    let mut machines = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let def_str: String = row.get(0)?;
+        if let Ok(m) = serde_json::from_str::<MachineDefinition>(&def_str) {
+            machines.push(m);
+        }
+    }
+    Ok(machines)
+}
+
+/// Prefilter (re-checked in `fire_timeout`): entities whose `region` is in `from` and whose
+/// entry for it is at or before `cutoff`. Region and state are bound parameters; no SQL text
+/// comes from the definition. Entries are read from `region_entries` when it belongs to the
+/// row's `state_version`, else from `updated_at` (exact for flat rows, an upper bound for
+/// parallel rows), exactly as `engine::effective_region_entries` does.
+async fn timeout_candidates(
+    db: &Database,
+    machine: &MachineDefinition,
+    region: &str,
+    from: &str,
+    cutoff: i64,
+) -> Result<Vec<String>, libsql::Error> {
+    let state_predicate = if machine.is_parallel() {
+        region_state_predicate("entities.current_state", 3, 4)
+    } else {
+        "current_state = ?4".to_string()
+    };
+    let sql = format!(
+        "SELECT entity_id FROM entities WHERE tenant_id = ?1 AND machine_id = ?2 AND {} AND COALESCE(\
+            CASE WHEN json_valid(entities.region_entries) THEN \
+              CASE WHEN json_extract(entities.region_entries, '$.version') = entities.state_version \
+              THEN (SELECT json_extract(re.value, '$.entered_at') FROM json_each(entities.region_entries, '$.regions') AS re \
+                    WHERE re.key = ?3 AND json_extract(re.value, '$.state') = ?4) END \
+            END, \
+            updated_at) <= ?5",
+        state_predicate
+    );
+
+    let conn = db.connect()?;
+    let mut rows = conn
+        .query(
+            &sql,
+            libsql::params![
+                machine.tenant_id.clone(),
+                machine.machine_id.clone(),
+                region.to_string(),
+                from.to_string(),
+                cutoff
+            ],
+        )
+        .await?;
+    // Drain before any write transaction starts.
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await? {
+        ids.push(row.get::<String>(0)?);
+    }
+    Ok(ids)
+}
+
+struct FiredTimeout {
+    from_state: String,
+    action_configs: Vec<(String, ActionConfig, Option<String>)>,
+}
+
+/// Fire one `$timeout` atomically, or return `None` when it is no longer due (state changed,
+/// instance not yet due, or another writer won).
+async fn fire_timeout(
+    db: &Database,
+    machine: &MachineDefinition,
+    tt: &TransitionDef,
+    region: &str,
+    entity_id: &str,
+    timeout_ms: i64,
+    now: i64,
+) -> Result<Option<FiredTimeout>, AppError> {
+    let conn = db.connect()?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .await?;
+
+    let entity = match load_entity_on(&tx, &machine.tenant_id, &machine.machine_id, entity_id).await {
+        Ok(e) => e,
+        Err(AppError::NotFound(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    let mut state_map = entity.state_map();
+    let from_state = match state_map.get(region) {
+        Some(s) if *s == tt.from => s.clone(),
+        _ => return Ok(None),
+    };
+    let entries = engine::effective_region_entries(&entity);
+    let entry = match entries.get(region) {
+        Some(e) => e.clone(),
+        None => return Ok(None),
+    };
+    if !engine::timeout_due(&entry, timeout_ms, now) {
+        return Ok(None);
+    }
+    let key = engine::timeout_identity(region, entry.seq);
+
+    let is_parallel = machine.is_parallel();
+    state_map.insert(region.to_string(), tt.to.clone());
+    // Check joins after timeout transition
+    let joins_fired = if is_parallel {
+        engine::apply_joins(machine, &mut state_map, 10)
+    } else {
+        Vec::new()
+    };
+    let new_state_encoded = Entity::encode_state(&state_map);
+    let version = entity.state_version + 1;
+
+    // Collect actions (fired by the caller after commit; join actions stay undispatched on this path)
+    let region_opt = if is_parallel { Some(region) } else { None };
+    let action_configs: Vec<(String, ActionConfig, Option<String>)> =
+        actions::collect_actions_for_state(&machine.actions, &tt.to, region_opt);
+    let dispatched_json =
+        serde_json::to_string(&actions::build_action_list(action_configs.clone()))?;
+
+    let cause = serde_json::json!({
+        "kind": "timeout",
+        "region": region,
+        "from": from_state,
+        "to": tt.to,
+        "entry": {"seq": entry.seq, "entered_at": entry.entered_at, "basis": entry.basis},
+        "timeout_ms": timeout_ms,
+        "due_at": entry.entered_at.saturating_add(timeout_ms),
+    });
+
+    // Record transition history (event_params keeps the legacy context snapshot)
+    let row = insert_history(
+        &tx,
+        &machine.tenant_id,
+        &machine.machine_id,
+        entity_id,
+        HistoryRow {
+            from_state: &from_state,
+            to_state: &tt.to,
+            event_type: "$timeout",
+            event_params: serde_json::to_string(&entity.context)?,
+            actions_dispatched: dispatched_json,
+            region: if is_parallel { region } else { "" },
+            timestamp: now,
+            now,
+            identity_key: &key,
+            cause: Some(cause),
+        },
+    )
+    .await;
+    let row = match row {
+        Ok(row) => row,
+        // This instance's timeout is already committed (another tick or process won).
+        Err(AppError::Conflict(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut entered = vec![RegionEntered {
+        region: region.to_string(),
+        state: tt.to.clone(),
+        row,
+        key: key.clone(),
+    }];
+    entered.extend(
+        insert_join_rows(
+            &tx, &machine.tenant_id, &machine.machine_id, entity_id,
+            &joins_fired, version, &key, now, now,
+        )
+        .await?,
+    );
+
+    // Optimistic locking: only transition if version matches
+    let new_entries = engine::advance_region_entries(&entries, &state_map, &entered, version, now);
+    match update_entity(
+        &tx,
+        &machine.tenant_id,
+        &machine.machine_id,
+        entity_id,
+        &new_state_encoded,
+        None,
+        &new_entries,
+        entity.state_version,
+        now,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(AppError::Conflict(_)) => return Ok(None), // Another transition won the race
+        Err(e) => return Err(e),
+    }
+
+    tx.commit().await?;
+    Ok(Some(FiredTimeout { from_state, action_configs }))
 }
 
 /// Look up an ingest token for a tenant from the DB.
-async fn lookup_ingest_token(conn: &libsql::Connection, tenant_id: &str) -> Option<String> {
+async fn lookup_ingest_token(db: &Database, tenant_id: &str) -> Option<String> {
+    let conn = db.connect().ok()?;
     let mut rows = conn
         .query(
             "SELECT token FROM ingest_tokens WHERE tenant_id = ?1",

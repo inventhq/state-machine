@@ -132,5 +132,64 @@ async fn migrate(conn: &Connection) -> Result<(), libsql::Error> {
     )
     .await?;
 
+    // Migration (E2): per-region entry instances. NULL for existing rows, which are read
+    // through engine::effective_region_entries and persisted on their next engine write.
+    let _ = conn
+        .execute("ALTER TABLE entities ADD COLUMN region_entries TEXT", ())
+        .await;
+
+    // Migration (E1/E3): semantic identity and provenance of history rows. NULL for existing
+    // rows, so the partial unique index below cannot conflict with legacy data.
+    let _ = conn
+        .execute("ALTER TABLE transitions ADD COLUMN identity_key TEXT", ())
+        .await;
+    let _ = conn
+        .execute("ALTER TABLE transitions ADD COLUMN cause TEXT", ())
+        .await;
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_transitions_identity
+            ON transitions(tenant_id, machine_id, entity_id, identity_key)
+            WHERE identity_key IS NOT NULL",
+        (),
+    )
+    .await?;
+
+    report_legacy_duplicates(conn).await?;
+
     Ok(())
+}
+
+/// Report (never modify) legacy history rows that share one dedup key. Dedup keeps consulting
+/// every such row, comparing params, so they are evidence rather than a migration blocker.
+/// Returns the number of duplicate groups.
+pub(crate) async fn report_legacy_duplicates(conn: &Connection) -> Result<usize, libsql::Error> {
+    let mut rows = conn
+        .query(
+            "SELECT tenant_id, machine_id, entity_id, event_type, timestamp, COUNT(*) FROM transitions
+             WHERE identity_key IS NULL AND event_type <> '$join'
+             GROUP BY tenant_id, machine_id, entity_id, event_type, timestamp HAVING COUNT(*) > 1",
+            (),
+        )
+        .await?;
+    let mut groups = 0usize;
+    while let Some(row) = rows.next().await? {
+        groups += 1;
+        if groups <= 20 {
+            warn!(
+                "Legacy duplicate history key (kept, not deleted): tenant={} machine={} entity={} event_type={} timestamp={} rows={}",
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<String>(2)?,
+                row.get::<String>(3)?,
+                row.get::<i64>(4)?,
+                row.get::<i64>(5)?
+            );
+        }
+    }
+    if groups > 0 {
+        warn!("Legacy duplicate history keys: {} group(s) retained unchanged", groups);
+    } else {
+        info!("Legacy duplicate history keys: none");
+    }
+    Ok(groups)
 }

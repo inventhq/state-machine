@@ -19,11 +19,11 @@ pub async fn transition_entity(
 ) -> Result<Json<TransitionResponse>, AppError> {
     let tenant_id = extract_tenant_id(&headers)?;
     let machine = load_machine(&state, &tenant_id, &machine_id).await?;
-    let entity = load_entity(&state, &tenant_id, &machine_id, &entity_id).await?;
+    load_entity(&state, &tenant_id, &machine_id, &entity_id).await?;
     let timestamp = req.timestamp.unwrap_or_else(now_millis);
 
     let resp = transition_core::execute_transition(
-        &state, &tenant_id, &machine, &entity, &req.event_type, &req.params, timestamp, true,
+        &state, &tenant_id, &machine, &entity_id, &req.event_type, &req.params, timestamp, true,
     )
     .await?;
 
@@ -41,7 +41,7 @@ pub async fn get_history(
 
     let mut rows = conn
         .query(
-            "SELECT id, tenant_id, machine_id, entity_id, from_state, to_state, event_type, event_params, actions_dispatched, region, timestamp, created_at FROM transitions WHERE tenant_id = ?1 AND machine_id = ?2 AND entity_id = ?3 ORDER BY timestamp ASC",
+            "SELECT id, tenant_id, machine_id, entity_id, from_state, to_state, event_type, event_params, actions_dispatched, region, timestamp, created_at, identity_key, cause FROM transitions WHERE tenant_id = ?1 AND machine_id = ?2 AND entity_id = ?3 ORDER BY timestamp ASC, id ASC",
             libsql::params![tenant_id, machine_id, entity_id],
         )
         .await?;
@@ -58,6 +58,12 @@ pub async fn get_history(
 
         let region_str: String = row.get::<String>(9).unwrap_or_default();
         let region = if region_str.is_empty() { None } else { Some(region_str) };
+        let identity_key: Option<String> = row.get::<Option<String>>(12).ok().flatten();
+        let cause: Option<serde_json::Value> = row
+            .get::<Option<String>>(13)
+            .ok()
+            .flatten()
+            .and_then(|c| serde_json::from_str(&c).ok());
 
         records.push(TransitionRecord {
             id: row.get(0)?,
@@ -72,6 +78,8 @@ pub async fn get_history(
             region,
             timestamp: row.get(10)?,
             created_at: row.get(11)?,
+            identity_key,
+            cause,
         });
     }
 

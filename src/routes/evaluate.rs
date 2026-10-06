@@ -3,6 +3,7 @@ use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::engine;
 use crate::errors::AppError;
 use crate::models::*;
 use crate::routes::entities::load_entity;
@@ -23,11 +24,11 @@ pub async fn evaluate(
     let entity_id = resolve_entity_id(&req.entity_key, &req.params)?;
 
     let machine = load_machine(&state, &tenant_id, &machine_id).await?;
-    let entity = load_or_create_entity(&state, &tenant_id, &machine_id, &entity_id, &machine).await?;
+    load_or_create_entity(&state, &tenant_id, &machine_id, &entity_id, &machine).await?;
     let timestamp = req.timestamp.unwrap_or_else(now_millis);
 
     let resp = transition_core::execute_transition(
-        &state, &tenant_id, &machine, &entity, &req.event_type, &req.params, timestamp, req.dispatch,
+        &state, &tenant_id, &machine, &entity_id, &req.event_type, &req.params, timestamp, req.dispatch,
     )
     .await?;
 
@@ -91,19 +92,18 @@ pub async fn evaluate_batch(
                 },
             };
 
-            let entity = match load_or_create_entity(&state, &tenant_id, &machine_id, &entity_id, &machine).await {
-                Ok(e) => e,
-                Err(e) => return BatchEventResult {
+            if let Err(e) = load_or_create_entity(&state, &tenant_id, &machine_id, &entity_id, &machine).await {
+                return BatchEventResult {
                     entity_id: Some(entity_id),
                     result: None,
                     error: Some(format!("{}", e)),
-                },
-            };
+                };
+            }
 
             let timestamp = event.timestamp.unwrap_or_else(now_millis);
 
             match transition_core::execute_transition(
-                &state, &tenant_id, &machine, &entity, &event.event_type, &event.params, timestamp, event.dispatch,
+                &state, &tenant_id, &machine, &entity_id, &event.event_type, &event.params, timestamp, event.dispatch,
             ).await {
                 Ok(resp) => BatchEventResult {
                     entity_id: Some(resp.entity_id.clone()),
@@ -181,12 +181,13 @@ async fn load_or_create_entity(
             let now = now_millis();
             let initial_state_map = machine.initial_state_map();
             let initial_state_encoded = Entity::encode_state(&initial_state_map);
+            let region_entries = engine::initial_region_entries(&initial_state_map, now);
             let context_json = "{}";
 
             let conn = state.db.connect()?;
             // INSERT OR IGNORE handles race conditions — two concurrent creates for the same entity
             conn.execute(
-                "INSERT OR IGNORE INTO entities (machine_id, tenant_id, entity_id, current_state, context, state_version, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT OR IGNORE INTO entities (machine_id, tenant_id, entity_id, current_state, context, state_version, created_at, updated_at, region_entries) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 libsql::params![
                     machine_id.to_string(),
                     tenant_id.to_string(),
@@ -195,7 +196,8 @@ async fn load_or_create_entity(
                     context_json.to_string(),
                     1_i64,
                     now,
-                    now
+                    now,
+                    serde_json::to_string(&region_entries)?
                 ],
             ).await?;
 
