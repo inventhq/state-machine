@@ -1,22 +1,36 @@
 # State Machine Service
 
-A multi-tenant, event-driven state machine engine built in Rust. Supports flat FSMs, parallel statecharts (Harel-style), sub-machines (hierarchical nesting), guard conditions, timeout transitions, join barriers, and webhook/event actions.
+A multi-tenant, event-driven state machine engine in Rust (Axum, Tokio, libsql/Turso). It supports:
+- flat machines and parallel regions, with joins;
+- guards, and persisted `$timeout` transitions;
+- child machines (sub-machines);
+- webhook and event actions.
+
+It implements the bounded semantics described here. It is **not** a general Harel statechart implementation; see
+[Known limitations](#known-limitations).
+
+**Contracts.** This README summarizes them; the contract documents are authoritative:
+
+| Contract | Document | Covers |
+|---|---|---|
+| `statemachine-e1e4.v1` | [docs/E1_E4_CONTRACT.md](docs/E1_E4_CONTRACT.md) | atomic writes, event identity and dedup, per-region entry instances and timers, timeout identity, legacy child provenance, bound region queries |
+| `statemachine-nested.v1` | [docs/NESTED_CONTRACT.md](docs/NESTED_CONTRACT.md) | opt-in **managed** child machines: eager start, atomic completion cascade, subtree cancellation, exact targeted delivery, bounds |
+
+Contributor and agent guide: [AGENTS.md](AGENTS.md).
 
 ## Quick Start
 
 ### Prerequisites
 
 - Rust 1.88+
-- (Optional) [Turso](https://turso.tech) account for remote database
+- (Optional) a [Turso](https://turso.tech) database; a local SQLite file works for development.
 
 ### Local Development
 
 ```bash
-# Clone
 git clone https://github.com/inventhq/state-machine.git
 cd state-machine
 
-# Create .env
 cat > .env <<EOF
 TURSO_DATABASE_URL=file:statemachine.db
 TURSO_AUTH_TOKEN=
@@ -26,50 +40,57 @@ TIMEOUT_INTERVAL_SECS=10
 EVENT_CORE_INGEST_URL=http://localhost:3030/ingest
 EOF
 
-# Run
 cargo run
-
-# Health check
 curl http://localhost:3051/health
 ```
+
+`.env` is read by `dotenvy` from the working directory or any parent directory. Set variables explicitly when that is
+not wanted.
 
 ### Environment Variables
 
 | Variable | Description | Default |
 |---|---|---|
-| `TURSO_DATABASE_URL` | Turso DB URL or `file:local.db` for local SQLite | `file:statemachine.db` |
-| `TURSO_AUTH_TOKEN` | Turso auth token (empty for local) | — |
-| `API_KEY` | Bearer token for API auth (empty = no auth) | — |
+| `TURSO_DATABASE_URL` | Turso URL, or a local file (`file:…`, an absolute path or `:memory:`) | `file:statemachine.db` |
+| `TURSO_AUTH_TOKEN` | Turso auth token (empty for local) | empty |
+| `API_KEY` | Bearer token for `/api/*` (empty = **no auth**, dev only) | empty |
 | `LISTEN_ADDR` | Bind address | `0.0.0.0:3050` |
-| `TIMEOUT_INTERVAL_SECS` | Timeout scheduler poll interval | `10` |
-| `EVENT_CORE_INGEST_URL` | URL to forward event actions to | `http://localhost:3030/ingest` |
-| `RUST_LOG` | Log level filter | `info` |
+| `TIMEOUT_INTERVAL_SECS` | `$timeout` scheduler poll interval | `10` |
+| `EVENT_CORE_INGEST_URL` | Where `event` actions are posted | `http://localhost:3030/ingest` |
+| `PLATFORM_API_URL` | Platform API used to provision per-tenant ingest tokens | `https://api.juicyapi.com` |
+| `PLATFORM_API_KEY` | Key for that provisioning call (empty = never provision) | empty |
+| `RUST_LOG` | Log filter | `info` |
 
 ---
 
-## Authentication
+## Authentication and Tenancy
 
-All `/api/*` endpoints require a Bearer token:
+All `/api/*` routes require `Authorization: Bearer <API_KEY>`. A wrong or missing key gets `401`. `/health` is
+unauthenticated.
 
-```
-Authorization: Bearer <API_KEY>
-```
+`X-Tenant-Id: <tenant>` selects the tenant namespace. `evaluate` and `evaluate/batch` fall back to `params.key_prefix`
+when the header is absent.
 
-The `/health` endpoint is unauthenticated.
-
-Multi-tenancy is header-based:
-
-```
-X-Tenant-Id: my_tenant
-```
+- The tenant is a **namespace asserted by the caller**, not an authorization boundary.
+- There is one shared API key.
 
 ---
 
-## Machine Types
+## Core Model
 
-### 1. Flat FSM
+- A **machine** is a definition, keyed by `(tenant, machine_id)`.
+- An **entity** is one instance of a machine, keyed by `(tenant, machine_id, entity_id)`.
+- An entity's state is a **region map**:
+  - **flat machine:** one region `"_"`. `current_state` is a string, for example `"processing"`;
+  - **parallel machine:** one entry per region. `current_state` is an object, for example
+    `{"payment": "captured", "fulfillment": "picking"}`.
+- Each event moves **at most one region**: the first matching transition in definition order wins. No event is
+  multicast.
+- Event `params` (strings) are merged into the entity's `context` on every applied transition.
 
-A simple finite state machine with a list of states and transitions between them.
+## Machine Definitions
+
+### Flat machine
 
 ```json
 {
@@ -84,35 +105,22 @@ A simple finite state machine with a list of states and transitions between them
 }
 ```
 
-Entity `current_state` is a plain string: `"processing"`.
-
-### 2. Parallel / Statechart Machine
-
-Multiple independent regions that advance in parallel. Uses Harel statechart semantics.
+### Parallel regions and joins
 
 ```json
 {
-  "machine_id": "order",
+  "machine_id": "order_parallel",
   "regions": [
-    {
-      "id": "payment",
-      "states": ["pending", "captured", "refunded"],
-      "initial_state": "pending"
-    },
-    {
-      "id": "fulfillment",
-      "states": ["picking", "packed", "shipped"],
-      "initial_state": "picking"
-    }
+    { "id": "payment", "states": ["pending", "captured"], "initial_state": "pending" },
+    { "id": "fulfillment", "states": ["picking", "packed", "complete"], "initial_state": "picking" }
   ],
   "transitions": [
     { "from": "pending", "to": "captured", "on": "pay", "region": "payment" },
-    { "from": "picking", "to": "packed", "on": "pack", "region": "fulfillment" },
-    { "from": "packed", "to": "shipped", "on": "ship", "region": "fulfillment" }
+    { "from": "picking", "to": "packed", "on": "pack", "region": "fulfillment" }
   ],
   "joins": [
     {
-      "when": { "payment": "captured", "fulfillment": "shipped" },
+      "when": { "payment": "captured", "fulfillment": "packed" },
       "target_region": "fulfillment",
       "target_state": "complete"
     }
@@ -120,363 +128,392 @@ Multiple independent regions that advance in parallel. Uses Harel statechart sem
 }
 ```
 
-Entity `current_state` is a JSON object: `{"payment": "captured", "fulfillment": "picking"}`.
+- Every parallel transition names its `region`.
+- **Joins:** when all `when` conditions hold after a write, `target_region` is set to `target_state` in the same write,
+  with a `$join` history row. Joins cascade up to 10 steps.
+- Joins are **level-triggered**: a join whose `when` does not include its target region can fire again after later
+  transitions. Two joins aimed at one region can alternate. Write each join's `when` so it names the target region
+  in a state other than the target.
+- Region ids are matched literally everywhere (they are never interpolated into SQL). Duplicate region ids are
+  rejected.
 
-**Joins** are barrier-style conditions: when all `when` conditions are simultaneously met, the `target_region` is set to `target_state`. Joins cascade (up to depth 10).
-
-### 3. Sub-Machine (Hierarchical / Nested)
-
-A state in the parent machine can contain its own child state machine. Events are forwarded to the child; when the child reaches a final state, the parent auto-advances.
-
-**Step 1: Define the child machine**
-
-```json
-{
-  "machine_id": "processing_flow",
-  "states": ["picking", "packing", "labeling"],
-  "initial_state": "picking",
-  "transitions": [
-    { "from": "picking", "to": "packing", "on": "picked" },
-    { "from": "packing", "to": "labeling", "on": "packed" }
-  ]
-}
-```
-
-**Step 2: Define the parent machine with `sub_machines`**
-
-```json
-{
-  "machine_id": "order",
-  "states": ["placed", "processing", "shipped", "delivered", "cancelled"],
-  "initial_state": "placed",
-  "transitions": [
-    { "from": "placed", "to": "processing", "on": "start_processing" },
-    { "from": "processing", "to": "cancelled", "on": "cancel" },
-    { "from": "shipped", "to": "delivered", "on": "deliver" }
-  ],
-  "sub_machines": {
-    "processing": {
-      "machine_id": "processing_flow",
-      "on_final": {
-        "labeling": "shipped"
-      }
-    }
-  }
-}
-```
-
-**How it works:**
-
-1. When the parent enters `"processing"`, a child entity is auto-created in `processing_flow`
-2. Events sent to the parent that don't match a parent transition are forwarded to the active child
-3. When the child reaches `"labeling"` (a key in `on_final`), the parent auto-advances to `"shipped"`
-4. **Escape transitions** (e.g. `cancel`) are evaluated at the parent level first and always take priority
-
-**Response when child handles an event:**
-
-```json
-{
-  "entity_id": "order_1",
-  "previous_state": "processing",
-  "current_state": "processing",
-  "transition": null,
-  "triggered_by": "picked",
-  "sub_machine": {
-    "machine_id": "processing_flow",
-    "entity_id": "order_1::sub::processing",
-    "previous_state": "picking",
-    "current_state": "packing",
-    "transition": "picking → packing",
-    "auto_completed": false
-  }
-}
-```
-
-**Response when child completes and parent auto-advances:**
-
-```json
-{
-  "entity_id": "order_1",
-  "previous_state": "processing",
-  "current_state": "shipped",
-  "transition": "processing → shipped",
-  "triggered_by": "packed",
-  "sub_machine": {
-    "machine_id": "processing_flow",
-    "entity_id": "order_1::sub::processing",
-    "previous_state": "packing",
-    "current_state": "labeling",
-    "transition": "packing → labeling",
-    "auto_completed": true
-  }
-}
-```
-
-Child entity IDs follow the pattern `{parent_entity_id}::sub::{compound_state}`.
-
----
-
-## Features
-
-### Guard Conditions
-
-Transitions can have guard conditions that must be satisfied for the transition to fire.
+### Guards
 
 ```json
 {
   "from": "pending",
   "to": "confirmed",
   "on": "pay",
-  "guard": {
-    "field": "amount_cents",
-    "op": "gt",
-    "value": 0
-  }
+  "guard": { "all": [
+    { "field": "amount_cents", "op": "gt", "value": 0 },
+    { "field": "currency", "op": "eq", "value": "USD" }
+  ] }
 }
 ```
 
-**Supported operators:** `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `exists`, `not_exists`
+- **Operators that exist:** `eq`, `neq` (also `ne`), `gt`, `gte`, `lt`, `lte`, `contains` (substring). Compound guards
+  use `all` and `any`. Any other operator evaluates **false**.
+- **Value lookup:** a field is read from the event `params` first, then from the entity `context`. A param that parses
+  as a number is compared as a float, so `eq` against an integer literal does not match; use `gte`/`lte`, or a float
+  literal such as `5.0`.
+- **Malformed guards pass.** A guard that is not an object, lacks `field`/`op`/`value`, or uses a non-array
+  `all`/`any` evaluates **true**. Validate guards before registering.
 
-**Compound guards:**
+### Timeouts
 
 ```json
-{
-  "guard": {
-    "all": [
-      { "field": "amount", "op": "gt", "value": 0 },
-      { "field": "currency", "op": "eq", "value": "USD" }
-    ]
-  }
-}
+{ "from": "pending", "to": "expired", "on": "$timeout", "guard": { "timeout_seconds": 3600 } }
 ```
 
-Also supports `"any"` for OR logic.
-
-Guard field values are resolved from event `params` first, then entity `context`.
-
-### Timeout Transitions
-
-Automatic transitions after a duration. The scheduler polls every `TIMEOUT_INTERVAL_SECS`.
-
-```json
-{
-  "from": "pending",
-  "to": "expired",
-  "on": "$timeout",
-  "guard": { "timeout_seconds": 3600 }
-}
-```
+- `timeout_seconds` must be a top-level integer. The scheduler checks every `TIMEOUT_INTERVAL_SECS`.
+- Region `r` times out from `f` when `r` is in `f` and **`r`'s own entry** is at least `timeout_seconds` old.
+  Transitions in other regions do not postpone it.
+- Entry instances are kept in `region_entries`. Every write that sets a region's state starts a new entry, including
+  an explicit self-transition, which re-enters and restarts that region's timer.
+- Each timeout commits once per entry instance, with identity `["timeout", region, seq]`. Restarts and concurrent ticks
+  do not repeat it.
 
 ### Actions
-
-Trigger webhooks or emit events when entering a state.
 
 ```json
 {
   "actions": [
-    {
-      "on_enter": "shipped",
-      "action": { "type": "webhook", "url": "https://example.com/notify" }
-    },
-    {
-      "on_enter": "shipped",
-      "action": { "type": "event", "event_type": "order.shipped" }
-    }
+    { "on_enter": "shipped", "action": { "type": "webhook", "url": "https://example.com/notify" } },
+    { "on_enter": "captured", "region": "payment", "action": { "type": "event", "event_type": "order.captured" } }
   ]
 }
 ```
 
-Actions can be scoped to a specific region for parallel machines:
+- Actions fire on entering a state. Join definitions may carry their own `actions`. On the `$timeout` path, join
+  actions are not dispatched.
+- With `dispatch: true` (the default for `evaluate`; always for `/transition` and the scheduler), actions are sent
+  **after the write commits**. Each makes up to 4 attempts with exponential backoff.
+- With `dispatch: false`, they are only returned in the response.
+- **Dispatch is best effort:** a crash between commit and dispatch loses that batch. There is no outbox.
+- A `dispatch: true` write also asks the platform for an ingest token when `PLATFORM_API_KEY` is set and none is
+  cached, even if the write has no actions.
 
-```json
-{ "on_enter": "captured", "region": "payment", "action": { "type": "webhook", "url": "..." } }
-```
+---
 
-When `dispatch: true` (default), actions fire server-side with retries. When `dispatch: false`, actions are returned in the response for client-side execution.
+## Execution Guarantees (`statemachine-e1e4.v1`)
 
-### Batch Evaluate
+- **One transaction per write.** Each request, and each timer candidate, runs in one `BEGIN IMMEDIATE` transaction. It
+  re-reads the entity, deduplicates, evaluates, and then writes history rows (`$join` included), state, context,
+  `state_version` and `region_entries` together. Any failure rolls back all of it.
+- **Event identity.** An external event is identified by `(event_type, timestamp)` on the entity it applies to;
+  `timestamp` defaults to the current time.
+  - Replaying it with **equal params** returns the unchanged duplicate response (`200`,
+    `reason: "duplicate event (already processed)"`).
+  - The same key with **different params** returns `409 EVENT_IDENTITY_CONFLICT` (`retry:false`), and nothing is
+    written.
+- **History** rows carry `identity_key`, for example `["evt","pay",1700000000000]`, `["timeout","_",3]`,
+  `["sub","b1","ret",2]` or `["join","fulfillment",4,0]`, and `cause` (provenance). Rows written before E1 have
+  `null`.
+- **Contention.** There is no busy timeout. A request or tick that cannot take the write lock gets
+  `500 … database is locked` (`retry:true`) with **nothing applied**. Replaying the same identity is safe.
+- **Legacy rows.** Rows written by a pre-E2 binary report truthful entry times: exact for flat rows, an upper bound for
+  parallel rows (a timer may fire late, never early).
 
-Process up to 1000 events in parallel:
+---
 
-```bash
-POST /api/machines/{machine_id}/evaluate/batch
-```
+## Child Machines
+
+A state can own a child machine through `sub_machines` (`regions[].sub_machines` for a parallel parent). The child
+entity id is `{parent_entity_id}::sub::{state}`, in the child machine's namespace.
+
+### Legacy children (default)
 
 ```json
 {
-  "events": [
-    { "event_type": "pay", "entity_key": "id", "params": { "id": "e1" } },
-    { "event_type": "pay", "entity_key": "id", "params": { "id": "e2" } }
+  "machine_id": "order",
+  "states": ["placed", "processing", "shipped", "cancelled"],
+  "initial_state": "placed",
+  "transitions": [
+    { "from": "placed", "to": "processing", "on": "start_processing" },
+    { "from": "processing", "to": "cancelled", "on": "cancel" }
+  ],
+  "sub_machines": {
+    "processing": { "machine_id": "processing_flow", "on_final": { "labeling": "shipped" } }
+  }
+}
+```
+
+- **Forwarding.** An event with no parent transition is forwarded to the active child: in region definition order, and
+  the first child that handles it wins. Parent transitions (escapes) always win.
+- **Lazy creation.** The child is created on the first forwarded event, not when the parent enters the state. It is not
+  reset if the state is entered again.
+- **Completion.** When the child's state is an `on_final` key, the parent advances in the same transaction, with a
+  `$sub_complete` row.
+- **Recovery.** An event that reaches an already-final child advances the parent (it consumes that event), but only if
+  that final state is backed by a committed child history row newer than the parent's entry. Otherwise the result is
+  `409 UNCORRELATED_CHILD_FINAL`.
+- Only flat children can complete. A legacy compound state cannot be a flat machine's `initial_state`. Replaying a
+  child-handled event at the parent answers "no transition".
+
+### Managed children (opt-in, `statemachine-nested.v1`)
+
+```json
+{
+  "machine_id": "bundle",
+  "regions": [
+    { "id": "b1", "states": ["idle", "ret_b1", "returned", "kept", "cancelled"], "initial_state": "idle",
+      "sub_machines": { "ret_b1": {
+        "machine_id": "return_case",
+        "lifecycle": "managed",
+        "complete_when": [
+          { "when": { "case": "returned", "deadline": "closed" }, "target": "returned" },
+          { "when": { "case": "kept", "deadline": "closed" }, "target": "kept" }
+        ]
+      } } }
+  ],
+  "transitions": [
+    { "region": "b1", "from": "idle", "to": "ret_b1", "on": "bundle.open" },
+    { "region": "b1", "from": "ret_b1", "to": "cancelled", "on": "bundle.cancel_b1" }
   ]
 }
 ```
 
-### Optimistic Locking
+With `"lifecycle": "managed"` on a compound state:
 
-All state updates use `state_version` for optimistic concurrency control. Concurrent modifications return `409 Conflict`.
+- **Start.** The child is created eagerly and create-only, in the same commit that enters the state. That includes
+  entity creation and a flat or region `initial_state` that is a managed compound. The child's own initial managed
+  states start recursively.
+- **Completion.**
+  - A flat child completes on `on_final[state]`.
+  - Any child completes on the first `complete_when` rule. A rule's `when` must name **every** child region; this is
+    how a parallel child completes.
+  - Completion is set in the same write. The child's remaining active descendants are cancelled, and the parent
+    advances (`$sub_complete`, `cause.via: "managed"`), cascading up to the root **in one commit**. This applies on
+    every path, scheduler timeouts included. There is no nudge or resume.
+- **Cancellation.** Any write that moves the parent region out of the compound state cancels the child subtree,
+  deepest first, in that commit: an explicit cancel edge, a join or a timeout. Each cancelled child gets a
+  `$sub_cancel` row and `instance.status: "cancelled"`. A cancelled child accepts no event and its timers never fire.
+  Siblings are untouched.
+- **Identity.** The child id is still `{parent}::sub::{state}`.
+  - Entity reads add `instance`: `{status, depth, path, started, ended}`. `path` runs root first, with each
+    ancestor's `{machine_id, entity_id, region, state, seq}`.
+  - Re-entering a managed compound state, or any existing entity at the child id, is refused with
+    `409 INSTANCE_CONFLICT`.
+  - Depth is at most 8 managed levels.
+- **Registration checks.** Registration rejects managed cycles, depth over 8, `complete_when` on a legacy child, a rule
+  that does not name every child region, and a managed compound state name that appears in more than one region.
 
-### Entity Auto-Creation
+#### Targeted delivery
 
-The `/evaluate` endpoint auto-creates entities in the machine's initial state if they don't exist. No need for a separate create call.
+`evaluate` accepts `target`: the managed compound states from the root to the instance. `target: []` is the root
+itself.
+
+```json
+{
+  "event_type": "decision.approve",
+  "entity_key": "id",
+  "params": { "id": "run-7" },
+  "timestamp": 9001,
+  "dispatch": false,
+  "target": [ { "region": "b1", "state": "ret_b1", "seq": 2 }, { "region": "case", "state": "settling" } ]
+}
+```
+
+- A step's `region` defaults to `"_"`. `seq` is optional; when given, it must equal the ancestor's current entry seq.
+- **Order:**
+  1. the engine deduplicates at the target, so a replay is a duplicate even after the instance ended;
+  2. it checks that every step is the current active instance, or answers `409 TARGET_NOT_ACTIVE`;
+  3. it evaluates **only the target's own transitions**, never forwarded down or up. Completion still cascades
+     upward.
+- A cancel edge on a parent is sent with `target` = the **parent's** path.
+- Direct `evaluate` on an ended managed child's machine returns `409 INSTANCE_NOT_ACTIVE`.
+
+**Response additions.** On targeted calls `target` is `{machine_id, entity_id, depth}`. `instances` lists the commit's
+lifecycle events in order, for example:
+
+```json
+{
+  "entity_id": "run-7::sub::ret_b1::sub::settling",
+  "previous_state": "observing",
+  "current_state": "settled",
+  "transition": "observing → settled",
+  "triggered_by": "return.buyer.observed",
+  "timestamp": 9002,
+  "target": { "machine_id": "settle", "entity_id": "run-7::sub::ret_b1::sub::settling", "depth": 2 },
+  "instances": [
+    { "kind": "completed", "machine_id": "settle", "entity_id": "run-7::sub::ret_b1::sub::settling", "depth": 2,
+      "parent": { "machine_id": "return_case", "entity_id": "run-7::sub::ret_b1", "region": "case", "state": "settling", "seq": 3 },
+      "row": 41, "key": "[\"evt\",\"return.buyer.observed\",9002]", "parent_to": "returned", "parent_row": 42,
+      "parent_key": "[\"sub\",\"case\",\"settling\",3]" }
+  ]
+}
+```
 
 ---
 
 ## API Reference
 
-All endpoints are prefixed with `/api` and require `Authorization: Bearer <token>` and `X-Tenant-Id` headers.
-
-### Machines
+All `/api` routes need `Authorization: Bearer <token>` and `X-Tenant-Id`.
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/machines` | Create a machine |
-| `GET` | `/api/machines` | List all machines |
+| `POST` | `/api/machines` | Create a machine (create-only; `409` if it exists) |
+| `GET` | `/api/machines` | List the tenant's machines |
 | `GET` | `/api/machines/{machine_id}` | Get a machine |
-| `PUT` | `/api/machines/{machine_id}` | Update a machine |
-| `DELETE` | `/api/machines/{machine_id}` | Delete a machine (fails if entities exist) |
-
-### Entities
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/machines/{machine_id}/entities` | Create an entity |
-| `GET` | `/api/machines/{machine_id}/entities` | List entities (filterable by `?state=`, `?region=`, `?updated_since=`) |
+| `PUT` | `/api/machines/{machine_id}` | Replace a machine definition in place (affects in-flight entities; per-process cache) |
+| `DELETE` | `/api/machines/{machine_id}` | Delete a machine (`409` while entities exist) |
+| `POST` | `/api/machines/{machine_id}/entities` | Create an entity (`{"entity_id", "context"?}`) |
+| `GET` | `/api/machines/{machine_id}/entities` | List entities; filters `?state=`, `?region=&state=` (parallel), `?updated_since=` |
 | `GET` | `/api/machines/{machine_id}/entities/{entity_id}` | Get an entity |
-| `DELETE` | `/api/machines/{machine_id}/entities/{entity_id}` | Delete an entity |
-
-### Evaluate (Recommended)
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/machines/{machine_id}/evaluate` | Evaluate a single event (auto-creates entity) |
-| `POST` | `/api/machines/{machine_id}/evaluate/batch` | Evaluate up to 1000 events in parallel |
+| `DELETE` | `/api/machines/{machine_id}/entities/{entity_id}` | Delete an entity **and its history** (children are not deleted) |
+| `POST` | `/api/machines/{machine_id}/evaluate` | Evaluate one event; auto-creates the entity |
+| `POST` | `/api/machines/{machine_id}/evaluate/batch` | Up to 1000 events, each as its own `evaluate` |
+| `POST` | `/api/machines/{machine_id}/entities/{entity_id}/transition` | Transition an existing entity (`{event_type, params, timestamp?}`; always dispatches) |
+| `GET` | `/api/machines/{machine_id}/entities/{entity_id}/history` | History rows, ordered by `timestamp`, then `id` |
+| `GET` | `/health` | Health check (no auth) |
 
 **Evaluate request:**
 
-```json
-{
-  "event_type": "pay",
-  "entity_key": "order_id",
-  "params": { "order_id": "abc123", "amount": "100" },
-  "dispatch": true,
-  "timestamp": 1700000000000
-}
-```
+| Field | Meaning |
+|---|---|
+| `event_type` | event name |
+| `entity_key` | which `params` field holds the entity id |
+| `params` | string map: merged into context, read by guards |
+| `timestamp` | identity of the event (default: now). Use a stable value per event to make replays safe |
+| `dispatch` | default `true` |
+| `target` | optional, managed targeted delivery (above) |
 
-- `entity_key` — which field in `params` holds the entity ID
-- `dispatch` — `true` (default): server fires actions; `false`: actions returned in response only
-- `timestamp` — optional, defaults to current time (used for dedup)
+**Responses:**
+- **Transition response:** `entity_id`, `previous_state`, `current_state`, `transition` (label or `null`), `region`,
+  `triggered_by`, `actions_dispatched`, `joins_fired`, `timestamp`, `reason` (no transition or duplicate),
+  `sub_machine` (one level), `target`, `instances`. Empty optional fields are omitted.
+- **Entity:** `machine_id`, `tenant_id`, `entity_id`, `current_state`, `context`, `state_version`, `created_at`,
+  `updated_at`, `region_entries` (per region: `{state, seq, entered_at, basis, row, key}`), and `instance` (managed
+  children only).
+- **History row:** `id`, `from_state`, `to_state`, `event_type` (`$join`, `$timeout`, `$sub_complete` and
+  `$sub_cancel` are engine rows), `event_params`, `actions_dispatched`, `region`, `timestamp`, `created_at`,
+  `identity_key`, `cause`.
+- **Batch:** `{total, succeeded, failed, results: [{entity_id?, result?, error?}]}`. A failed event's `error` is a
+  string.
 
-### Transitions
+### Errors
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/api/machines/{machine_id}/entities/{entity_id}/transition` | Transition a specific entity |
-| `GET` | `/api/machines/{machine_id}/entities/{entity_id}/history` | Get transition history |
+Errors are `{"error": {"code", "message", "retry"}}`.
 
-### Health
-
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/health` | Health check (no auth required) |
+| Code | Status | `retry` | When |
+|---|---|---|---|
+| `BAD_REQUEST` | 400 | false | invalid request or definition; missing tenant; a `target` naming a non-managed state |
+| `UNAUTHORIZED` | 401 | false | missing or wrong bearer token |
+| `NOT_FOUND` | 404 | false | unknown machine or entity |
+| `CONFLICT` | 409 | true | machine/entity already exists, delete with entities, or the version/identity guard (not expected while writers use the transaction) |
+| `EVENT_IDENTITY_CONFLICT` | 409 | false | same `(event_type, timestamp)` with different params |
+| `UNCORRELATED_CHILD_FINAL` | 409 | false | legacy recovery refused (child final not provable) |
+| `TARGET_NOT_ACTIVE` | 409 | false | targeted path or entry is not the current active instance |
+| `INSTANCE_NOT_ACTIVE` | 409 | false | event for an ended managed child |
+| `INSTANCE_CONFLICT` | 409 | false | managed start would reuse an existing entity (re-entry or collision) |
+| `NESTING_DEPTH_EXCEEDED` | 409 | false | managed start beyond 8 levels |
+| `INTERNAL_ERROR` | 500 | true | database error, including `database is locked`; nothing was committed |
 
 ---
 
 ## Database
 
-Uses [Turso](https://turso.tech) (libsql) with embedded replica support for sub-millisecond reads.
+libsql/Turso. A local file or `:memory:` URL uses a local database. Remote URLs try an embedded replica first and fall
+back to a pure remote connection.
 
-**Tables:**
+| Table | Contents |
+|---|---|
+| `machines` | definitions (PK `tenant_id, machine_id`) |
+| `entities` | state, context, `state_version`, `region_entries` (E2), `instance` (managed children) |
+| `transitions` | history, with `region`, `identity_key` (unique per entity when set) and `cause` |
+| `ingest_tokens` | per-tenant tracker tokens |
 
-- `machines` — machine definitions (PK: `tenant_id, machine_id`)
-- `entities` — entity state + context (PK: `tenant_id, machine_id, entity_id`)
-- `transitions` — audit log of all state transitions
-
-Migrations run automatically on startup. Schema changes use idempotent `ALTER TABLE ... ADD COLUMN` statements.
-
-For local development, set `TURSO_DATABASE_URL=file:statemachine.db` to use a local SQLite file.
+Migrations run at every startup and are idempotent (`CREATE … IF NOT EXISTS`, `ALTER TABLE … ADD COLUMN`). Startup
+also logs, and never modifies, legacy history rows that share one `(event_type, timestamp)` key.
 
 ---
 
-## Deployment
+## Known Limitations
 
-### Docker
-
-```bash
-docker build -t state-machine .
-docker run -p 3051:3051 \
-  -e TURSO_DATABASE_URL=... \
-  -e TURSO_AUTH_TOKEN=... \
-  -e API_KEY=... \
-  state-machine
-```
-
-### Kubernetes
-
-Manifests are in `k8s/`:
-
-```
-k8s/
-├── namespace.yaml
-├── deployment.yaml    # 2 replicas, resource limits, env from secrets
-├── service.yaml       # ClusterIP on port 3051
-├── ingress.yaml       # External access
-├── hpa.yaml           # Auto-scale 2-6 replicas at 70% CPU
-└── secrets.yaml       # Template (real secrets managed via kubectl)
-```
-
-### CI/CD
-
-GitHub Actions workflow (`.github/workflows/deploy.yml`):
-
-1. Build Docker image
-2. Push to GHCR (`ghcr.io/inventhq/state-machine:<sha>`)
-3. Apply K8s manifests
-4. Update image tag + restart rollout
-
-Triggered on push to `main`.
+- **Contention (E6):** there is no busy timeout or WAL. A write that loses the lock fails immediately with `500
+  database is locked` (nothing applied). Under concurrency most losers are refused rather than queued.
+- **Not a general statechart:**
+  - no history states;
+  - no re-entry of a managed compound state;
+  - one region per event (no multicast);
+  - level-triggered joins (E5);
+  - no unrestricted cycles.
+- **Managed child already final at start (review EF-1):** a managed child whose initial state already satisfies its
+  completion rule is never completed, so its parent stays in the compound state. Loaders must refuse such definitions.
+  Likewise, `complete_when` must cover every terminal combination the child can reach, or the parent can be stranded.
+- **Corrupt instance metadata (review EF-2):** an undecodable `entities.instance` value is read as "not managed", which
+  fails open: direct evaluate and timers treat it like a root. It is reachable only through database corruption or a
+  foreign writer.
+- **Legacy children:** a replay of a child-handled event at the parent is "no transition", not duplicate (E7). The
+  recovery advance consumes its event. Children are never reset. A legacy (lazy) child does not start managed initial
+  states inside it.
+- **Effects:** dispatch after commit is best effort, with no outbox. Ingest-token provisioning can run for writes
+  without actions (E8).
+- **Operations:**
+  - `PUT` replaces definitions in place, and the definition cache is per process;
+  - deleting an entity deletes its history (its dedup memory) but not its children; re-creating the root then hits
+    `INSTANCE_CONFLICT`;
+  - run no pre-E2 binary against the same database;
+  - the startup duplicate audit scans legacy history.
+- **Remote Turso and embedded-replica transactions** are not covered by the test suite, which uses local files.
 
 ---
 
 ## Testing
 
 ```bash
-# Unit tests (9 tests: flat FSM, parallel, joins, guards)
-cargo test
-
-# Run locally and test via curl
-cargo run &
-curl -X POST http://localhost:3051/api/machines \
-  -H "Authorization: Bearer dev_secret" \
-  -H "X-Tenant-Id: test" \
-  -H "Content-Type: application/json" \
-  -d '{"machine_id":"demo","states":["a","b"],"initial_state":"a","transitions":[{"from":"a","to":"b","on":"go"}]}'
+cargo test           # all suites
+cargo test nested    # managed nested children only
+cargo test e1e4      # E1–E4 DB-backed tests only
 ```
 
+The accepted suite at engine `ebe04589` is **46 tests** (author-run; this documentation change did not rerun them):
+
+| File | Tests | Scope |
+|---|---|---|
+| `src/engine.rs` | 18 | pure evaluation, guards, joins (9 original), identity keys, entry instances, legacy derivation, region validation |
+| `src/e1e4_tests.rs` | 19 | DB-backed: fault rollback with zero outbound requests, replay and conflict, concurrency, old-schema startup, region timers, timeout and join receipts, legacy child provenance, bound region queries |
+| `src/nested_tests.rs` | 9 | DB-backed managed children: depth-3 cascade through a reused parallel child, timeout cascade across restart, selected cancellation, event-vs-timer race, re-entry refusal, depth and cycle bounds, whole-cascade rollback, validation, managed initial compound states |
+
+DB-backed tests use a disposable SQLite file and an in-process loopback HTTP sink; failures are injected with SQLite
+triggers on that file.
+
 ---
+
+## Deployment
+
+- **Docker:** a multi-stage build on `debian:bookworm-slim` (exposes 3051).
+- **Kubernetes:** manifests in `k8s/`:
+  - `namespace.yaml`;
+  - `deployment.yaml` (2 replicas);
+  - `service.yaml`;
+  - `ingress.yaml`, `certificate.yaml`, `cluster-issuer.yaml`, `traefik-lb.yaml`;
+  - `hpa.yaml` (2–6 replicas at 70% CPU);
+  - `secrets.yaml` (template; real secrets are created by the workflow).
+- **CI/CD:** `.github/workflows/deploy.yml` builds and pushes `ghcr.io/inventhq/state-machine` on every push to `main`,
+  then deploys.
 
 ## Project Structure
 
 ```
 src/
-├── main.rs              # Entry point, router setup, middleware
-├── models.rs            # All data types: MachineDefinition, Entity, TransitionResponse, etc.
-├── engine.rs            # Pure transition evaluation, guard checking, join logic
-├── transition_core.rs   # Shared transition execution: DB update, actions, sub-machine runtime
-├── actions.rs           # Webhook/event action dispatch with retry
-├── scheduler.rs         # Background $timeout transition poller
+├── main.rs              # Entry point, router, auth layer, scheduler start
+├── models.rs            # Definitions, entities, region entries, managed instances, API types, validation
+├── engine.rs            # Pure evaluation, guards, joins, identity keys, entry-instance helpers
+├── transition_core.rs   # Transactional write path, dedup, targeted delivery, child lifecycle
+├── scheduler.rs         # $timeout poller (per-candidate transaction)
+├── actions.rs           # Webhook/event dispatch with retry
+├── ingest_tokens.rs     # Per-tenant ingest token provisioning
 ├── auth.rs              # Bearer token middleware
-├── db.rs                # Database init, migrations, replica fallback
-├── errors.rs            # AppError enum → HTTP status codes
-└── routes/
-    ├── mod.rs           # AppState, helpers
-    ├── machines.rs      # Machine CRUD + DashMap cache
-    ├── entities.rs      # Entity CRUD + list filters
-    ├── evaluate.rs      # Single + batch evaluate endpoints
-    └── transitions.rs   # Direct transition + history endpoints
+├── db.rs                # Database init, migrations, legacy duplicate audit
+├── errors.rs            # AppError → HTTP status and codes
+├── e1e4_tests.rs        # DB-backed E1–E4 tests
+├── nested_tests.rs      # DB-backed managed-children tests
+└── routes/              # machines, entities, evaluate, transitions
+docs/
+├── E1_E4_CONTRACT.md    # statemachine-e1e4.v1
+└── NESTED_CONTRACT.md   # statemachine-nested.v1
 ```
-
----
 
 ## License
 

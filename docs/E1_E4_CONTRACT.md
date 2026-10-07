@@ -4,6 +4,11 @@ Additive changes on top of `226279ae`. Every existing route, field and default i
 versioned schema/API note for E1 (atomic writes and dedup identity), E2 (per-region entry instances), E3 (timeout
 identity and parent/child provenance) and E4 (bound region queries).
 
+Child machines described here are **legacy** children (the default). Opt-in **managed** children, with eager start,
+an atomic completion cascade, subtree cancellation and targeted delivery, are specified in
+[NESTED_CONTRACT.md](NESTED_CONTRACT.md) (`statemachine-nested.v1`). Every guarantee in this file also holds for
+their writes. The [README](../README.md) summarizes both contracts.
+
 ## Schema (idempotent startup migration)
 
 | Change | Existing rows |
@@ -115,6 +120,7 @@ History records carry `identity_key` (string or null) and `cause` (object or nul
 One region per event (first match); level-triggered joins and same-region join alternation; no busy timeout or WAL;
 a replay of a child-handled event at the parent still answers "no transition"; the recovery advance still consumes its
 trigger; child entity ids carry no generation and a compound re-entry does not reset the child; parallel children
-cannot complete a parent; orphaned child timers still fire into the orphaned child; ingest tokens are still provisioned
+cannot complete a parent; orphaned child timers still fire into the orphaned child (all of these are about legacy
+children; managed children differ, see [NESTED_CONTRACT.md](NESTED_CONTRACT.md)); ingest tokens are still provisioned
 for `dispatch=true` writes without actions. Embedded-replica and remote Turso transactions are not covered by the local
 tests. This is not a claim of general statechart correctness.

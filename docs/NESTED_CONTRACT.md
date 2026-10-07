@@ -183,8 +183,26 @@ ended child it returns `409 INSTANCE_NOT_ACTIVE`; dedup still answers replays fi
 | `NESTING_DEPTH_EXCEEDED` | 409 | a start beyond 8 levels |
 | `BAD_REQUEST` | 400 | `target` names a non-managed or unknown compound state; definition validation; an invalid `complete_when` at start |
 
-## 8. Not supported
+## 7. Not supported, and known caveats
 
-History states; re-entry of a managed compound state; unrestricted cycles; multicast or multi-region firing;
-edge-triggered joins (E5); busy timeout (E6); legacy nested-duplicate propagation (E7); engine-held per-instance args;
-a cancel API separate from edges; cascade delete with the root. This is not a general statechart claim.
+Not supported: history states; re-entry of a managed compound state; unrestricted cycles; multicast or multi-region
+firing; edge-triggered joins (E5); busy timeout (E6); legacy nested-duplicate propagation (E7); engine-held
+per-instance args; a cancel API separate from edges; cascade delete with the root. This is not a general statechart
+claim.
+
+Known caveats (documented, not fixed; from the independent engine review):
+
+- **Already final at start (EF-1).** Completion is checked only after a write to the child. A managed child whose
+  initial state already satisfies its `on_final`/`complete_when` predicate is therefore never completed, and its
+  parent stays in `S`. Loaders must refuse such definitions. Likewise, `complete_when` must cover every terminal
+  combination the child can reach. An uncovered one leaves the child active, and the parent waits.
+- **Undecodable instance metadata (EF-2).** An `entities.instance` value that cannot be parsed is read as "not
+  managed". Direct evaluate and the scheduler then treat that entity like a root; targeted delivery still refuses it.
+  It is reachable only through storage corruption or a foreign writer.
+- **Legacy child containing managed states.** A legacy (lazily created) child whose machine starts in a managed
+  compound state does not start that grandchild; managed starts happen only at root creation, at entering writes and
+  at a managed child's start. Use managed edges throughout a nested template.
+- **Deleted roots.** Deleting a root entity leaves its child entities. Re-creating the same root id then hits
+  `INSTANCE_CONFLICT` at its first managed entry.
+- **Contention (E6).** A request or tick that loses the immediate write lock gets `500 database is locked` with
+  nothing applied. Concurrent races are therefore mostly decided by lock order.
