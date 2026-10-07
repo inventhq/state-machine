@@ -2,6 +2,8 @@
 
 This document is for AI coding agents (Copilot, Cascade, Cursor, etc.) working on this codebase. It describes the architecture, key abstractions, data flow, and common patterns you need to understand before making changes.
 
+The behavioural contracts are authoritative: [docs/E1_E4_CONTRACT.md](docs/E1_E4_CONTRACT.md) (`statemachine-e1e4.v1`: atomic writes, identity, region timers) and [docs/NESTED_CONTRACT.md](docs/NESTED_CONTRACT.md) (`statemachine-nested.v1`: managed child machines). The [README](README.md) summarizes the API, errors and known limitations.
+
 ## Stack
 
 - **Language:** Rust (edition 2021, requires 1.88+)
@@ -23,30 +25,47 @@ src/
 ├── engine.rs            — Pure functions (no DB, no async). evaluate() finds matching transitions,
 │                          check_guard() evaluates guard conditions, check_joins()/apply_joins()
 │                          handle barrier-style join conditions. Unit tests live here.
-├── transition_core.rs   — The heart of the system. execute_transition() is called by all routes.
-│                          Handles: dedup check → evaluate → state update → optimistic lock →
-│                          audit log → action dispatch. Sub-machine runtime lives here too:
+├── transition_core.rs   — The heart of the system. Entry points: execute_transition() (all routes),
+│                          execute_targeted() (evaluate.target) and create_root_with_children().
+│                          Each opens one BEGIN IMMEDIATE transaction (Ctx) and dispatches actions
+│                          only after commit. transition_in_tx() re-reads, dedups, evaluates;
+│                          write_entity() is the single write path (history + $join rows → region
+│                          entries → managed completion → guarded UPDATE → child lifecycle →
+│                          parent completion). Managed children: start_child(), cancel_subtree(),
+│                          complete_parent(), forward_to_managed_child(). Legacy children:
 │                          try_sub_machine_forward(), handle_sub_machine_event(),
-│                          advance_parent_state(), create_child_entity().
+│                          advance_parent_state(), correlate_child_final(), create_child_entity().
 ├── actions.rs           — dispatch_actions() fires webhooks/events server-side with retry.
 │                          build_action_list() returns structured actions without firing.
 │                          collect_actions_for_state() filters actions by state + optional region.
 ├── scheduler.rs         — Background task: polls for $timeout transitions every N seconds.
-│                          Region-aware (uses json_extract for parallel machines).
+│                          Candidate query binds region/state (json_each), skips ended managed
+│                          instances; each candidate fires in its own transaction via write_entity.
+├── ingest_tokens.rs     — Per-tenant ingest token lookup/provisioning (PLATFORM_API_URL/KEY).
 ├── auth.rs              — Axum middleware: validates Authorization: Bearer <token>.
 │                          Empty API_KEY = no auth (dev mode).
 ├── db.rs                — Database init with replica fallback. Migrations are idempotent
 │                          (CREATE TABLE IF NOT EXISTS + ALTER TABLE ADD COLUMN).
-├── errors.rs            — AppError enum maps to HTTP status codes (400, 401, 404, 409, 500).
+├── errors.rs            — AppError enum maps to HTTP status codes (400, 401, 404, 409, 500);
+│                          Rejected{code} = 409 retry:false (EVENT_IDENTITY_CONFLICT,
+│                          UNCORRELATED_CHILD_FINAL, TARGET_NOT_ACTIVE, INSTANCE_NOT_ACTIVE,
+│                          INSTANCE_CONFLICT, NESTING_DEPTH_EXCEEDED).
+├── e1e4_tests.rs        — DB-backed E1–E4 tests (shared fixture helpers).
+├── nested_tests.rs      — DB-backed managed-children tests.
 └── routes/
-    ├── mod.rs           — AppState struct (db, http_client, event_core_ingest_url, machine_cache).
+    ├── mod.rs           — AppState struct (db, http_client, event_core_ingest_url, machine_cache,
+    │                      platform_api_url/key, ingest_token_cache).
     │                      Helper: extract_tenant_id(), now_millis().
-    ├── machines.rs      — CRUD for machine definitions. load_machine() checks DashMap cache first.
-    │                      Cache is invalidated on update/delete.
-    ├── entities.rs      — CRUD for entities. load_entity() used by transition_core and evaluate.
-    │                      list_entities supports ?state=, ?region=, ?updated_since= filters.
+    ├── machines.rs      — CRUD for machine definitions. load_machine() checks DashMap cache first;
+    │                      update/delete refresh this process's cache only. create/update run
+    │                      check_managed_nesting() (acyclic, ≤ 8 levels, complete_when coverage).
+    ├── entities.rs      — CRUD for entities. load_entity()/load_entity_on() (inside a transaction),
+    │                      ENTITY_COLUMNS, region_state_predicate() (bound json_each). list_entities
+    │                      supports ?state=, ?region=&state=, ?updated_since=. A machine starting in a
+    │                      managed compound state is created via create_root_with_children().
     ├── evaluate.rs      — POST /evaluate (single) and /evaluate/batch (up to 1000 parallel).
-    │                      Auto-creates entities via load_or_create_entity().
+    │                      Auto-creates entities via load_or_create_entity(); `target` routes to
+    │                      execute_targeted().
     └── transitions.rs   — POST /transition (direct entity transition) and GET /history.
 ```
 
@@ -60,21 +79,41 @@ HTTP POST /api/machines/{id}/evaluate
   → evaluate handler (routes/evaluate.rs)
     → load_machine() from DashMap cache or DB
     → load_or_create_entity() — auto-creates in initial state if missing
-    → transition_core::execute_transition()
-      → dedup check (SELECT from transitions by event+timestamp)
+    → transition_core::execute_transition() — one BEGIN IMMEDIATE transaction
+      → re-read entity inside the transaction
+      → dedup check (rows with same event_type+timestamp; equal params = duplicate,
+        different params = 409 EVENT_IDENTITY_CONFLICT)
       → engine::evaluate() — pure CPU, finds matching transition + checks guards
       → IF match found:
         → update state_map, apply joins, encode new state
-        → collect + dispatch actions
-        → optimistic lock UPDATE (state_version check)
-        → record transition history
+        → collect actions (not fired yet)
+        → insert history row + $join rows (identity_key, cause)
+        → guarded UPDATE of state, context, version, region_entries
       → IF no match:
         → try_sub_machine_forward() — check if current state is a compound state
-          → load child machine, load/create child entity
-          → recursively call execute_transition on child
-          → if child completed (final state) → advance_parent_state()
+          → legacy child: load/create it lazily (same transaction), recurse into
+            transition_in_tx; if it reached an on_final state → advance_parent_state();
+            if it was already final → recovery advance only if correlated
+            (else 409 UNCORRELATED_CHILD_FINAL)
+          → managed child: forward only if active; its completion has already cascaded
+            inside the child's write_entity()
         → if still no match → return "no transition" response
-    ← TransitionResponse JSON
+      → every write_entity(): cancel the managed child of each region it left, start the
+        managed child of each managed compound state it entered (recursively), and, for an
+        active managed child that now satisfies on_final/complete_when, mark it completed
+        and advance its parent ($sub_complete), cascading upward
+      → COMMIT, then (dispatch=true) ingest token + action dispatch
+    ← TransitionResponse JSON (+ `instances` lifecycle events)
+```
+
+### Targeted Evaluate (`target` present)
+
+```
+transition_core::execute_targeted()
+  → resolve the target entity from definitions (each step must be a managed compound state)
+  → dedup at the target ("duplicate" even after the instance ended)
+  → every step must be the current active instance (else 409 TARGET_NOT_ACTIVE)
+  → transition_in_tx(forward = false): the target's own transitions only
 ```
 
 ## Key Abstractions
@@ -101,18 +140,44 @@ UPDATE entities SET ... WHERE state_version = ?
 ```
 
 If `affected == 0`, another transition won the race → return `409 Conflict`.
+Every writer runs in a `BEGIN IMMEDIATE` transaction (E1), so this guard is not expected to
+trip; contention surfaces as `500 database is locked` with nothing applied.
+
+### Managed Nested Children (statemachine-nested.v1)
+
+See `docs/NESTED_CONTRACT.md`. `SubMachineDef.lifecycle = "managed"` (opt-in; legacy is the
+default and unchanged) gives a compound state an eager, create-only child
+(`{parent}::sub::{state}`, with `entities.instance` = status/depth/path), atomic completion
+cascades on every path (`on_final` for flat children, `complete_when` naming every region for
+parallel children; the scheduler included), and subtree cancellation whenever the parent leaves
+the compound state. `evaluate.target` delivers to exactly one managed instance with no
+forwarding. All of it runs inside the one transaction of `write_entity` in `transition_core.rs`
+(`start_child`, `cancel_subtree`, `complete_parent`). Re-entry of a managed compound state is
+refused (`INSTANCE_CONFLICT`); depth is bounded by `MAX_MANAGED_DEPTH` (8).
+
+### Region Entry Instances and Identity (E1–E4)
+
+See `docs/E1_E4_CONTRACT.md` (`statemachine-e1e4.v1`). `entities.region_entries` records each
+region's current entry instance (`seq`, `entered_at`, creating history row); the scheduler times
+out a region from its own entry. History rows carry `identity_key` and `cause`. Region names are
+never interpolated into SQL (`json_each` with bound parameters). Pure helpers live in `engine.rs`
+(`effective_region_entries`, `advance_region_entries`, `*_identity`).
 
 ### Sub-Machine Convention
 
-- Child entity ID: `{parent_entity_id}::sub::{compound_state_name}`
+- Child entity ID: `{parent_entity_id}::sub::{compound_state_name}` (legacy and managed)
 - Child entities live in the child machine's namespace (separate `machine_id`)
-- Parent auto-advance is recorded as `event_type = "$sub_complete"` in audit log
-- Escape transitions (parent-level) always take priority over sub-machine forwarding
-- Sub-machine forwarding uses `Box::pin()` for async recursion
+- Parent auto-advance is recorded as `event_type = "$sub_complete"` in audit log; managed
+  cancellation as `$sub_cancel` on each cancelled child
+- Escape transitions (parent-level) always take priority over untargeted sub-machine forwarding
+- Legacy (`lifecycle` absent): lazy child, forward-path completion, correlated recovery advance
+- Managed (`lifecycle: "managed"`): eager create-only start, atomic completion cascade, subtree
+  cancellation on exit, `instance` metadata, no re-entry, exact `target` delivery
+- Recursion (forwarding, starts, cancellations, completions) uses `Box::pin()`
 
 ### Machine Definition Caching
 
-`load_machine()` in `routes/machines.rs` uses a `DashMap<(tenant_id, machine_id), MachineDefinition>`. Cache is populated on first read, invalidated on update/delete. This means machine lookups on the hot path are ~0ns after the first call.
+`load_machine()` in `routes/machines.rs` uses a `DashMap<(tenant_id, machine_id), MachineDefinition>`. Cache is populated on first read and refreshed on update/delete **in the serving process only**; other replicas keep their copy. The scheduler reads definitions from the database (through its transaction). Machine lookups on the hot path are ~0ns after the first call.
 
 ## How to Add a New Feature
 
@@ -148,13 +213,16 @@ If `affected == 0`, another transition won the race → return `409 Conflict`.
 
 ### Unit Tests
 
-All unit tests are in `src/engine.rs` under `#[cfg(test)] mod tests`. They test the pure evaluation engine (no DB required).
+Pure unit tests are in `src/engine.rs` under `#[cfg(test)] mod tests` (no DB required).
+DB-backed tests are in `src/e1e4_tests.rs` and `src/nested_tests.rs`: each uses a disposable
+SQLite file and an in-process loopback HTTP sink, and injects failures with SQLite triggers on
+that file. The accepted suite at engine `ebe04589` is **46 tests** (18 + 19 + 9).
 
 ```bash
 cargo test
 ```
 
-Current tests (9):
+Original engine tests (9):
 - `test_simple_transition` — basic flat FSM transition
 - `test_no_valid_transition` — event with no matching transition
 - `test_guard_passes` / `test_guard_fails` — guard condition evaluation
@@ -163,6 +231,19 @@ Current tests (9):
 - `test_join_fires_when_all_satisfied` — join barrier fires
 - `test_join_not_satisfied` — join doesn't fire when conditions not met
 - `test_join_does_not_refire` — join idempotency
+
+Nested tests (9, `nested_tests.rs`): depth-3 completion cascade through a parallel child with one
+definition reused for two sibling branches, timeout cascade across restart, selected-branch
+cancellation (late events/timers inert), event-vs-timer race with one winner, re-entry refusal,
+depth/cycle bounds, whole-cascade rollback, definition and target validation, and managed
+compound initial states in flat and parallel machines (published bundle-return.v3 shape).
+
+E1–E4 tests (28): 9 pure helper tests in `engine.rs` (identity keys, params equality, entry
+instances, legacy derivation, region validation) and 19 DB-backed tests in `e1e4_tests.rs`
+(rollback on history/join/update/`$sub_complete`/`$timeout` faults with zero outbound requests,
+exact replay vs identity conflict, concurrent duplicates and ticks, old-schema startup with
+legacy duplicates, region timer independence/re-entry/legacy/stale entries, timeout+join receipt,
+child timeout → parent recovery provenance, uncorrelated/stale child final, bound region queries).
 
 ### E2E Testing
 
@@ -195,25 +276,29 @@ curl http://localhost:3051/api/machines/demo/entities/e1 \
 
 ## Common Pitfalls
 
-### 1. Forgetting `sub_machines: HashMap::new()` in test fixtures
+### 1. Forgetting new fields in test fixtures
 
-`MachineDefinition` has a `sub_machines` field. All test machine constructors in `engine.rs` must include it.
+`MachineDefinition` has a `sub_machines` field, and `Entity` has `region_entries` and `instance`. All test constructors in `engine.rs` must include them (`None` for plain entities). `SubMachineDef` derives `Default`, so use `..Default::default()` for `lifecycle`/`complete_when`.
 
 ### 2. Async recursion requires boxing
 
-Sub-machine forwarding creates recursive async calls (`execute_transition` → `try_sub_machine_forward` → `handle_sub_machine_event` → `execute_transition`). Rust async fns can't be recursive without `Box::pin()` at the recursive call site.
+Sub-machine forwarding creates recursive async calls (`transition_in_tx` → `try_sub_machine_forward` → `handle_sub_machine_event`/`forward_to_managed_child` → `transition_in_tx`), and the managed lifecycle recurses through `write_entity` → `complete_parent` → `advance_parent_state` → `write_entity` and `start_child`/`cancel_subtree`. Rust async fns can't be recursive without `Box::pin()` at the recursive call site.
 
 ### 3. Flat vs parallel state encoding
 
 `current_state` is a plain string for flat machines but a JSON object for parallel machines. Always use `entity.state_map()` to read and `Entity::encode_state()` to write. Never compare `current_state` directly.
 
-### 4. TransitionResponse needs all fields
+### 4. Constructing TransitionResponse
 
-When constructing a `TransitionResponse`, all fields must be present including `sub_machine: None` for non-sub-machine transitions. Missing this causes compile errors.
+`TransitionResponse` derives `Default`; construct it with the fields you set plus `..Default::default()` (`sub_machine`, `target` and `instances` default to empty). `execute_transition`/`execute_targeted` fill `instances` after commit.
 
 ### 5. Machine cache invalidation
 
-If you change how machine definitions are stored or loaded, remember that `routes/machines.rs` uses a `DashMap` cache. Updates and deletes invalidate the cache entry. New fields in `MachineDefinition` are automatically cached since the whole struct is cached.
+If you change how machine definitions are stored or loaded, remember that `routes/machines.rs` uses a `DashMap` cache. Updates and deletes refresh the entry in the serving process only. New fields in `MachineDefinition` are automatically cached since the whole struct is cached.
+
+### 8. Every write goes through `write_entity`
+
+Do not add a separate `UPDATE entities` or history `INSERT` path: `write_entity` keeps history, `region_entries`, `instance` and the managed lifecycle consistent inside the caller's transaction, and actions must stay queued in `Ctx.pending` until after commit.
 
 ### 6. Migrations must be idempotent
 

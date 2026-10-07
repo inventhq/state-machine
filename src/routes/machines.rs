@@ -28,6 +28,7 @@ pub async fn create_machine(
     };
 
     machine.validate().map_err(AppError::BadRequest)?;
+    check_managed_nesting(&state, &tenant_id, &machine).await?;
 
     let definition_json = serde_json::to_string(&machine)?;
     let now = now_millis();
@@ -110,6 +111,7 @@ pub async fn update_machine(
     machine.sub_machines = req.sub_machines;
 
     machine.validate().map_err(AppError::BadRequest)?;
+    check_managed_nesting(&state, &tenant_id, &machine).await?;
 
     let definition_json = serde_json::to_string(&machine)?;
     let now = now_millis();
@@ -205,4 +207,46 @@ pub async fn load_machine(
         }
         None => Err(AppError::NotFound(format!("Machine '{}' not found", machine_id))),
     }
+}
+
+/// Managed references (statemachine-nested.v1) must be acyclic, at most `MAX_MANAGED_DEPTH`
+/// levels deep, and every `complete_when` rule must name each region of its child. Checked over
+/// the definitions registered now; unregistered children are skipped (the runtime start checks
+/// the same rules).
+async fn check_managed_nesting(
+    state: &AppState,
+    tenant_id: &str,
+    machine: &MachineDefinition,
+) -> Result<(), AppError> {
+    let mut stack: Vec<(MachineDefinition, Vec<String>)> =
+        vec![(machine.clone(), vec![machine.machine_id.clone()])];
+    while let Some((current, chain)) = stack.pop() {
+        for sub in current.managed_refs() {
+            if chain.contains(&sub.machine_id) {
+                return Err(AppError::BadRequest(format!(
+                    "managed sub-machine cycle: {} -> {}",
+                    chain.join(" -> "),
+                    sub.machine_id
+                )));
+            }
+            if chain.len() > MAX_MANAGED_DEPTH {
+                return Err(AppError::BadRequest(format!(
+                    "managed nesting deeper than {} levels: {} -> {}",
+                    MAX_MANAGED_DEPTH,
+                    chain.join(" -> "),
+                    sub.machine_id
+                )));
+            }
+            let child = match load_machine(state, tenant_id, &sub.machine_id).await {
+                Ok(child) => child,
+                Err(AppError::NotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            sub.check_rules_against(&child).map_err(AppError::BadRequest)?;
+            let mut next = chain.clone();
+            next.push(sub.machine_id.clone());
+            stack.push((child, next));
+        }
+    }
+    Ok(())
 }
