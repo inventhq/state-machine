@@ -537,3 +537,162 @@ async fn managed_definitions_and_targets_are_validated() {
     let stale = eval_t(&fx, "main", "v", "begin", 3, json!([{"region":"b1","state":"ret_b1","seq":99},{"region":"case","state":"settling"}])).await;
     assert!(is_rejected(&stale, TARGET_NOT_ACTIVE));
 }
+
+/// Targeted delivery with adapter-built params (guards read them).
+async fn eval_tp(
+    fx: &Fixture,
+    root: &str,
+    event: &str,
+    timestamp: i64,
+    target: serde_json::Value,
+    extra: serde_json::Value,
+) -> Result<TransitionResponse, AppError> {
+    let mut params = serde_json::Map::from_iter([("eid".to_string(), json!(root))]);
+    params.extend(extra.as_object().cloned().unwrap_or_default());
+    let req: EvaluateRequest = serde_json::from_value(json!({
+        "event_type": event, "entity_key": "eid", "params": params,
+        "timestamp": timestamp, "dispatch": false, "target": target,
+    }))
+    .unwrap();
+    routes::evaluate::evaluate(State(fx.state.clone()), headers(T), Path("br-main".to_string()), Json(req))
+        .await
+        .map(|j| j.0)
+}
+
+/// Regression for the published bundle-return.v3 shape (app msg_dcde4c2bfb4e): a flat machine
+/// whose initial state is a managed compound (`settle` starts in `reversing`) must register and
+/// start its child eagerly, recursively, as must a parallel child starting in a managed compound
+/// (`return.case` starts in `requesting`). Legacy compound initial states stay refused.
+#[tokio::test]
+async fn managed_initial_compound_starts_eagerly_in_flat_and_parallel_machines() {
+    let fx = fixture().await;
+    let outcome = |v: &str| json!({"field": "own.outcome", "op": "eq", "value": v});
+
+    // The legacy guard is unchanged.
+    let legacy = mk_machine(&fx, T, json!({
+        "machine_id": "legacy-initial", "states": ["work","done"], "initial_state": "work", "transitions": [],
+        "sub_machines": {"work": {"machine_id": "br-owned-effect", "on_final": {"done": "done"}}}
+    })).await;
+    assert!(matches!(legacy, Err(AppError::BadRequest(m)) if m.contains("initial_state 'work' cannot be a compound state")));
+
+    mk_machine(&fx, T, json!({
+        "machine_id": "br-owned-effect", "states": ["pending","in_progress","done","refused","needs_owner","timed_out"],
+        "initial_state": "pending",
+        "transitions": [
+            {"from":"pending","to":"done","on":"seg.answered","guard": outcome("done")},
+            {"from":"pending","to":"in_progress","on":"seg.answered","guard": outcome("in_progress")},
+            {"from":"pending","to":"refused","on":"seg.answered","guard": outcome("refused")},
+            {"from":"in_progress","to":"done","on":"seg.observed","guard": outcome("done")},
+            {"from":"in_progress","to":"timed_out","on":"$timeout","guard":{"timeout_seconds":5}}
+        ], "actions": []
+    })).await.unwrap();
+    // Flat, initial state a managed compound: refused at acd5beaa (400), registered now.
+    mk_machine(&fx, T, json!({
+        "machine_id": "br-settle", "states": ["reversing","observing","settled","needs_owner"], "initial_state": "reversing",
+        "transitions": [
+            {"from":"observing","to":"settled","on":"return.buyer.observed","guard":{"field":"own.buyer","op":"eq","value":"credited"}},
+            {"from":"observing","to":"needs_owner","on":"return.buyer.observed","guard":{"field":"own.buyer","op":"eq","value":"not_credited"}}
+        ],
+        "sub_machines": {"reversing": {"machine_id":"br-owned-effect","lifecycle":"managed",
+            "on_final":{"done":"observing","refused":"needs_owner","needs_owner":"needs_owner","timed_out":"needs_owner"}}},
+        "actions": []
+    })).await.unwrap();
+    mk_machine(&fx, T, json!({
+        "machine_id": "br-return",
+        "regions": [
+            {"id":"case","states":["requesting","requested","settling","returned","refused","needs_owner"],"initial_state":"requesting",
+             "sub_machines": {
+                "requesting": {"machine_id":"br-owned-effect","lifecycle":"managed",
+                    "on_final":{"done":"requested","refused":"refused","needs_owner":"needs_owner","timed_out":"needs_owner"}},
+                "settling": {"machine_id":"br-settle","lifecycle":"managed","on_final":{"settled":"returned","needs_owner":"needs_owner"}}}},
+            {"id":"deadline","states":["idle","closed"],"initial_state":"idle"}
+        ],
+        "transitions": [
+            {"region":"case","from":"requested","to":"settling","on":"return.routed","guard":{"field":"own.return_state","op":"eq","value":"approved"}}
+        ],
+        "actions": []
+    })).await.unwrap();
+    let ret_ref = json!({"machine_id":"br-return","lifecycle":"managed","complete_when":[
+        {"when":{"case":"returned","deadline":"idle"},"target":"returned"},
+        {"when":{"case":"refused","deadline":"idle"},"target":"needs_owner"},
+        {"when":{"case":"needs_owner","deadline":"idle"},"target":"needs_owner"}]});
+    mk_machine(&fx, T, json!({
+        "machine_id": "br-main",
+        "regions": [
+            {"id":"batch","states":["draft","open","completed"],"initial_state":"draft"},
+            {"id":"b1","states":["idle","ret_b1","returned","needs_owner"],"initial_state":"idle","sub_machines":{"ret_b1": ret_ref}},
+            {"id":"b2","states":["idle","ret_b2","returned","needs_owner"],"initial_state":"idle","sub_machines":{"ret_b2": ret_ref}}
+        ],
+        "joins": [
+            {"when":{"batch":"open","b1":"idle"},"target_region":"b1","target_state":"ret_b1"},
+            {"when":{"batch":"open","b2":"idle"},"target_region":"b2","target_state":"ret_b2"},
+            {"when":{"batch":"open","b1":"returned","b2":"returned"},"target_region":"batch","target_state":"completed"}
+        ],
+        "transitions": [{"region":"batch","from":"draft","to":"open","on":"bundle.start"}],
+        "actions": []
+    })).await.unwrap();
+
+    // bundle.start: two joins enter both branches; each `return` starts with `case` in the
+    // managed `requesting`, whose owned-effect starts too, all in this one commit.
+    mk_entity(&fx, T, "br-main", "br").await;
+    let start = eval(&fx, T, "br-main", "br", "bundle.start", 1, &[], false).await.unwrap();
+    let started: Vec<_> = start.instances.iter().map(|e| (e.kind.as_str(), e.entity_id.as_str(), e.depth)).collect();
+    assert_eq!(started, vec![
+        ("started", "br::sub::ret_b1", 1),
+        ("started", "br::sub::ret_b1::sub::requesting", 2),
+        ("started", "br::sub::ret_b2", 1),
+        ("started", "br::sub::ret_b2::sub::requesting", 2),
+    ]);
+    let req1 = entity(&fx, T, "br-owned-effect", "br::sub::ret_b1::sub::requesting").await.unwrap();
+    assert_eq!((req1.current_state.as_str(), status(&req1)), ("pending", Some(InstanceStatus::Active)));
+
+    // requesting completes → case requested; routed (approved) → settling: the flat `settle`
+    // starts in its managed initial `reversing`, whose owned-effect starts recursively.
+    let b1 = json!([{"region":"b1","state":"ret_b1"}]);
+    let b1_req = json!([{"region":"b1","state":"ret_b1"},{"region":"case","state":"requesting"}]);
+    let b1_set = json!([{"region":"b1","state":"ret_b1"},{"region":"case","state":"settling"}]);
+    let b1_rev = json!([{"region":"b1","state":"ret_b1"},{"region":"case","state":"settling"},{"state":"reversing"}]);
+    let r = eval_tp(&fx, "br", "seg.answered", 2, b1_req, json!({"own.outcome":"done"})).await.unwrap();
+    assert_eq!(r.instances.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["completed"]);
+    let routed = eval_tp(&fx, "br", "return.routed", 3, b1.clone(), json!({"own.return_state":"approved"})).await.unwrap();
+    let started: Vec<_> = routed.instances.iter().map(|e| (e.kind.as_str(), e.entity_id.as_str(), e.depth)).collect();
+    assert_eq!(started, vec![
+        ("started", "br::sub::ret_b1::sub::settling", 2),
+        ("started", "br::sub::ret_b1::sub::settling::sub::reversing", 3),
+    ]);
+    let settle = entity(&fx, T, "br-settle", "br::sub::ret_b1::sub::settling").await.unwrap();
+    assert_eq!((settle.current_state.as_str(), settle.state_version), ("reversing", 1));
+    let leaf = entity(&fx, T, "br-owned-effect", "br::sub::ret_b1::sub::settling::sub::reversing").await.unwrap();
+    let leaf_inst = leaf.instance.unwrap();
+    assert_eq!((leaf_inst.status, leaf_inst.depth), (InstanceStatus::Active, 3));
+    assert_eq!((leaf_inst.parent().state.as_str(), leaf_inst.parent().seq), ("reversing", 1));
+
+    // The leaf finishes (settle → observing), the buyer observation settles it, and completion
+    // cascades settle → return → root b1 in that commit; b2 stays in its own requesting.
+    eval_tp(&fx, "br", "seg.answered", 4, b1_rev, json!({"own.outcome":"done"})).await.unwrap();
+    assert_eq!(entity(&fx, T, "br-settle", "br::sub::ret_b1::sub::settling").await.unwrap().current_state, "observing");
+    let done = eval_tp(&fx, "br", "return.buyer.observed", 5, b1_set, json!({"own.buyer":"credited"})).await.unwrap();
+    let completed: Vec<_> = done.instances.iter().map(|e| (e.kind.as_str(), e.entity_id.as_str(), e.parent_to.as_deref())).collect();
+    assert_eq!(completed, vec![
+        ("completed", "br::sub::ret_b1::sub::settling", Some("returned")),
+        ("completed", "br::sub::ret_b1", Some("returned")),
+    ]);
+    let root = entity(&fx, T, "br-main", "br").await.unwrap();
+    assert_eq!(root.state_map()["b1"], "returned");
+    assert_eq!((root.state_map()["b2"].as_str(), root.state_map()["batch"].as_str()), ("ret_b2", "open"));
+    let b2_req = entity(&fx, T, "br-owned-effect", "br::sub::ret_b2::sub::requesting").await.unwrap();
+    assert_eq!((b2_req.current_state.as_str(), status(&b2_req)), ("pending", Some(InstanceStatus::Active)));
+
+    // A flat ROOT whose initial state is a managed compound starts its child at creation.
+    mk_machine(&fx, T, json!({
+        "machine_id": "br-flat-root", "states": ["working","done"], "initial_state": "working", "transitions": [],
+        "sub_machines": {"working": {"machine_id":"br-owned-effect","lifecycle":"managed","on_final":{"done":"done"}}},
+        "actions": []
+    })).await.unwrap();
+    mk_entity(&fx, T, "br-flat-root", "fr").await;
+    let child = entity(&fx, T, "br-owned-effect", "fr::sub::working").await.unwrap();
+    assert_eq!((child.current_state.as_str(), child.instance.unwrap().depth), ("pending", 1));
+    let fin = eval(&fx, T, "br-owned-effect", "fr::sub::working", "seg.answered", 6, &[("own.outcome", "done")], false).await.unwrap();
+    assert_eq!(fin.instances.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), vec!["completed"]);
+    assert_eq!(entity(&fx, T, "br-flat-root", "fr").await.unwrap().current_state, "done");
+}

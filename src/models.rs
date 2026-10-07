@@ -295,7 +295,9 @@ impl MachineDefinition {
             if !self.states.contains(state) {
                 return Err(format!("sub_machine state '{}' not in states list", state));
             }
-            if state == &self.initial_state {
+            // A legacy child is created lazily and never on entry, so a legacy compound cannot be
+            // initial. A managed one starts with the entity (statemachine-nested.v1 §3.1).
+            if state == &self.initial_state && !sub.is_managed() {
                 return Err(format!(
                     "initial_state '{}' cannot be a compound state (sub-machine)",
                     state

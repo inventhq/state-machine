@@ -49,6 +49,9 @@ unchanged. v1/v2 templates and all 37 existing tests must stay exact.
 - Every rule's `when` must be non-empty and its `target` must be a state of the parent (region).
 - `on_final` targets as before.
 - A managed compound state name must appear in **only one** region of its machine (child ids are keyed by state).
+- A flat machine's `initial_state` (like a region's) may be a **managed** compound state: its child starts with the
+  entity (section 3.1). A **legacy** compound `initial_state` is still refused, because legacy children never start on
+  entry.
 - Managed references must be acyclic and at most 8 levels deep over the definitions registered at that moment.
   Unregistered children are skipped there; the runtime bound in section 5 always applies.
 
@@ -83,7 +86,8 @@ unchanged. v1/v2 templates and all 37 existing tests must stay exact.
    - a join;
    - a `$sub_complete` target;
    - a `$timeout` target;
-   - creation of a root whose region starts in `S`.
+   - creation of a root whose region (or flat `initial_state`) starts in `S`;
+   - the start of a managed child whose own initial state (flat or a region's) is managed compound, recursively.
 2. **Cancellation is any exit.** A write that moves `r` away from the `S` instance cancels that child and, deepest
    first, its active descendants, in the same commit. Each cancelled entity gets:
    - version+1;
