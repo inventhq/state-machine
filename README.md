@@ -295,8 +295,16 @@ With `"lifecycle": "managed"` on a compound state:
   - Re-entering a managed compound state, or any existing entity at the child id, is refused with
     `409 INSTANCE_CONFLICT`.
   - Depth is at most 8 managed levels.
-- **Registration checks.** Registration rejects managed cycles, depth over 8, `complete_when` on a legacy child, a rule
-  that does not name every child region, and a managed compound state name that appears in more than one region.
+- **Registration checks.**
+  - Registration always rejects `complete_when` on a legacy child, and a managed compound state name that appears in
+    more than one region.
+  - Managed cycles, depth over 8, and `complete_when` rules that do not name every child region are checked only
+    against children that are **already registered**. A child that is not registered yet is skipped at registration.
+  - The same rules apply when that child starts:
+    - a rule gap returns `400`;
+    - a child machine still missing returns `404`;
+    - depth over 8 returns `409 NESTING_DEPTH_EXCEEDED`. That bound also stops a cycle among definitions registered
+      out of order.
 
 #### Targeted delivery
 
@@ -348,7 +356,9 @@ lifecycle events in order, for example:
 
 ## API Reference
 
-All `/api` routes need `Authorization: Bearer <token>` and `X-Tenant-Id`.
+All `/api` routes need `Authorization: Bearer <token>` and `X-Tenant-Id`. `evaluate` and `evaluate/batch` accept
+`params.key_prefix` instead when the header is absent (legacy fallback; see
+[Authentication and Tenancy](#authentication-and-tenancy)).
 
 | Method | Path | Description |
 |---|---|---|
