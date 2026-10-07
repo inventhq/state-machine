@@ -128,6 +128,16 @@ pub fn join_identity(target_region: &str, seq: i64, step: usize) -> String {
     serde_json::json!(["join", target_region, seq, step]).to_string()
 }
 
+/// `$sub_cancel` of a managed child instance whose parent entry was `seq`.
+pub fn cancel_identity(parent_seq: i64) -> String {
+    serde_json::json!(["cancel", parent_seq]).to_string()
+}
+
+/// Entity id of the child of compound `state` (legacy and managed children alike).
+pub fn child_entity_id(parent_entity_id: &str, state: &str) -> String {
+    format!("{}::sub::{}", parent_entity_id, state)
+}
+
 /// True when a stored history `event_params` value equals the request params (as maps).
 /// Unparseable or absent stored params never match.
 pub fn same_event_params(stored: Option<&str>, params: &HashMap<String, String>) -> bool {
@@ -448,6 +458,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             region_entries: None,
+            instance: None,
         }
     }
 
@@ -525,6 +536,7 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             region_entries: None,
+            instance: None,
         }
     }
 
@@ -654,6 +666,7 @@ mod tests {
             created_at: created,
             updated_at: updated,
             region_entries: None,
+            instance: None,
         }
     }
 
@@ -790,14 +803,14 @@ mod tests {
         let mut bad_sub = test_parallel_machine();
         bad_sub.regions[2].sub_machines.insert(
             "nope".into(),
-            SubMachineDef { machine_id: "child".into(), on_final: HashMap::new() },
+            SubMachineDef { machine_id: "child".into(), on_final: HashMap::new(), ..Default::default() },
         );
         assert!(bad_sub.validate().unwrap_err().contains("sub_machine state 'nope'"));
 
         let mut bad_target = test_parallel_machine();
         bad_target.regions[2].sub_machines.insert(
             "ready".into(),
-            SubMachineDef { machine_id: "child".into(), on_final: HashMap::from([("done".into(), "elsewhere".into())]) },
+            SubMachineDef { machine_id: "child".into(), on_final: HashMap::from([("done".into(), "elsewhere".into())]), ..Default::default() },
         );
         assert!(bad_target.validate().unwrap_err().contains("on_final target 'elsewhere'"));
     }

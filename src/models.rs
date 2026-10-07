@@ -3,6 +3,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const DEFAULT_REGION: &str = "_";
 
+/// Maximum depth of managed child instances below a root (`instance.depth`).
+pub const MAX_MANAGED_DEPTH: usize = 8;
+
 // ── Machine Definition ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,12 +42,110 @@ pub struct RegionDef {
     pub sub_machines: HashMap<String, SubMachineDef>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SubMachineDef {
     /// Machine ID of the sub-machine (must exist in same tenant)
     pub machine_id: String,
     /// Maps sub-machine final state → parent region target state
+    #[serde(default)]
     pub on_final: HashMap<String, String>,
+    /// `managed`: eager start, atomic completion cascade and subtree cancellation
+    /// (statemachine-nested.v1). `legacy` (default): lazy child, as before.
+    #[serde(default, skip_serializing_if = "ChildLifecycle::is_legacy")]
+    pub lifecycle: ChildLifecycle,
+    /// Managed only: ordered rules naming every child region; the first satisfied rule
+    /// completes the child to `target`. Completes parallel children.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub complete_when: Vec<CompletionRule>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildLifecycle {
+    #[default]
+    Legacy,
+    Managed,
+}
+
+impl ChildLifecycle {
+    pub fn is_legacy(&self) -> bool {
+        *self == ChildLifecycle::Legacy
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompletionRule {
+    /// Child region → required state, for every child region ("_" for a flat child).
+    pub when: BTreeMap<String, String>,
+    /// Parent (region) state entered on completion.
+    pub target: String,
+}
+
+impl SubMachineDef {
+    pub fn is_managed(&self) -> bool {
+        self.lifecycle == ChildLifecycle::Managed
+    }
+
+    /// Parent target when a child in `child_state` is complete: `on_final` for a flat child,
+    /// then the first fully satisfied `complete_when` rule.
+    pub fn completion_target(&self, child_state: &HashMap<String, String>) -> Option<&str> {
+        if child_state.len() == 1 {
+            if let Some(target) = child_state.get(DEFAULT_REGION).and_then(|s| self.on_final.get(s)) {
+                return Some(target);
+            }
+        }
+        self.complete_when
+            .iter()
+            .find(|rule| {
+                rule.when
+                    .iter()
+                    .all(|(region, state)| child_state.get(region) == Some(state))
+            })
+            .map(|rule| rule.target.as_str())
+    }
+
+    /// Every `complete_when` rule names exactly the child's regions, with states of those regions.
+    pub fn check_rules_against(&self, child: &MachineDefinition) -> Result<(), String> {
+        let regions: BTreeMap<&str, &[String]> = if child.is_parallel() {
+            child.regions.iter().map(|r| (r.id.as_str(), r.states.as_slice())).collect()
+        } else {
+            BTreeMap::from([(DEFAULT_REGION, child.states.as_slice())])
+        };
+        for rule in &self.complete_when {
+            let named: Vec<&str> = rule.when.keys().map(|k| k.as_str()).collect();
+            let expected: Vec<&str> = regions.keys().copied().collect();
+            if named != expected {
+                return Err(format!(
+                    "complete_when rule for '{}' must name every child region {:?}, got {:?}",
+                    rule.target, expected, named
+                ));
+            }
+            for (region, state) in &rule.when {
+                if !regions[region.as_str()].contains(state) {
+                    return Err(format!(
+                        "complete_when state '{}' is not in child region '{}' of '{}'",
+                        state, region, child.machine_id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_shape(&self, owner_states: &[String]) -> Result<(), String> {
+        if !self.is_managed() && !self.complete_when.is_empty() {
+            return Err("complete_when requires lifecycle 'managed'".into());
+        }
+        for rule in &self.complete_when {
+            if rule.when.is_empty() {
+                return Err("complete_when rule needs a non-empty 'when'".into());
+            }
+            if !owner_states.contains(&rule.target) {
+                return Err(format!("complete_when target '{}' not in states list", rule.target));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +224,31 @@ impl MachineDefinition {
         }
     }
 
+    /// The managed sub-machine of compound `state` in `region`, if any.
+    pub fn managed_sub(&self, region: &str, state: &str) -> Option<&SubMachineDef> {
+        if !self.is_parallel() && region != DEFAULT_REGION {
+            return None;
+        }
+        self.sub_machine_for_state(state, region).filter(|s| s.is_managed())
+    }
+
+    /// Managed child references (`machine_id`, def) declared anywhere in this machine.
+    pub fn managed_refs(&self) -> Vec<&SubMachineDef> {
+        let mut refs: Vec<&SubMachineDef> =
+            self.sub_machines.values().filter(|s| s.is_managed()).collect();
+        for r in &self.regions {
+            refs.extend(r.sub_machines.values().filter(|s| s.is_managed()));
+        }
+        refs
+    }
+
+    /// True when a new entity starts in a managed compound state (its children start at creation).
+    pub fn has_managed_initial(&self) -> bool {
+        self.initial_state_map()
+            .iter()
+            .any(|(region, state)| self.managed_sub(region, state).is_some())
+    }
+
     /// Look up a sub-machine definition for a state in a given region.
     pub fn sub_machine_for_state(&self, state: &str, region: &str) -> Option<&SubMachineDef> {
         if self.is_parallel() {
@@ -183,6 +309,7 @@ impl MachineDefinition {
                     ));
                 }
             }
+            sub.validate_shape(&self.states)?;
         }
         Ok(())
     }
@@ -224,6 +351,17 @@ impl MachineDefinition {
                             r.id, target
                         ));
                     }
+                }
+                sub.validate_shape(&r.states)
+                    .map_err(|e| format!("region '{}' sub_machine '{}': {}", r.id, state, e))?;
+                // Managed child ids are keyed by the compound state name alone.
+                if sub.is_managed()
+                    && self.regions.iter().any(|o| o.id != r.id && o.states.contains(state))
+                {
+                    return Err(format!(
+                        "managed compound state '{}' must appear in only one region",
+                        state
+                    ));
                 }
             }
         }
@@ -297,6 +435,56 @@ pub struct Entity {
     /// written before E2 or by a writer that does not maintain it.
     #[serde(default)]
     pub region_entries: Option<StoredRegionEntries>,
+    /// Managed child instance (`entities.instance`); `None` for roots and legacy children.
+    #[serde(default)]
+    pub instance: Option<ChildInstance>,
+}
+
+// ── Managed child instances (statemachine-nested.v1) ────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstanceStatus {
+    Active,
+    Completed,
+    Cancelled,
+}
+
+/// One ancestor on a managed child's path: that entity is in `state` of `region`, entry `seq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstanceStep {
+    pub machine_id: String,
+    pub entity_id: String,
+    pub region: String,
+    pub state: String,
+    pub seq: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstanceEnd {
+    pub row: i64,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChildInstance {
+    pub status: InstanceStatus,
+    pub depth: usize,
+    /// Root first; the last step is the direct parent.
+    pub path: Vec<InstanceStep>,
+    /// The child's `state_version` at its start.
+    pub started: i64,
+    pub ended: Option<InstanceEnd>,
+}
+
+impl ChildInstance {
+    pub fn parent(&self) -> &InstanceStep {
+        self.path.last().expect("a managed instance has a parent")
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.status == InstanceStatus::Active
+    }
 }
 
 // ── Region entry instances (E2) ─────────────────────────────────────────────
@@ -397,6 +585,7 @@ impl Entity {
             created_at: self.created_at,
             updated_at: self.updated_at,
             region_entries: crate::engine::effective_region_entries(self),
+            instance: self.instance.clone(),
         }
     }
 }
@@ -427,6 +616,9 @@ pub struct EntityResponse {
     pub updated_at: i64,
     /// Current entry instance of every region ("_" for flat machines).
     pub region_entries: BTreeMap<String, RegionEntry>,
+    /// Managed child instance; absent on roots and legacy children.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<ChildInstance>,
 }
 
 // ── Transition Record (audit log) ───────────────────────────────────────────
@@ -473,7 +665,7 @@ pub struct TransitionRequest {
     pub timestamp: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct TransitionResponse {
     pub entity_id: String,
     pub previous_state: serde_json::Value,
@@ -491,6 +683,41 @@ pub struct TransitionResponse {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sub_machine: Option<SubMachineTransition>,
+    /// Targeted delivery only: the entity the event was applied to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetInfo>,
+    /// Managed lifecycle events of this commit, in order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub instances: Vec<InstanceEvent>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetInfo {
+    pub machine_id: String,
+    pub entity_id: String,
+    pub depth: usize,
+}
+
+/// A managed child started, completed or was cancelled in a commit.
+#[derive(Debug, Clone, Serialize)]
+pub struct InstanceEvent {
+    pub kind: String,
+    pub machine_id: String,
+    pub entity_id: String,
+    pub depth: usize,
+    pub parent: InstanceStep,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_row: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_key: Option<String>,
 }
 
 /// Sub-machine transition detail returned when an event is forwarded to a child machine.
@@ -546,10 +773,28 @@ pub struct EvaluateRequest {
     /// Default: true (backward compatible — server dispatches actions).
     #[serde(default = "default_true")]
     pub dispatch: bool,
+    /// Targeted delivery (statemachine-nested.v1): managed compound states from the root to the
+    /// target entity; `[]` is the root. The target's own transitions only, never forwarded.
+    #[serde(default)]
+    pub target: Option<Vec<TargetStep>>,
 }
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TargetStep {
+    #[serde(default = "default_region")]
+    pub region: String,
+    pub state: String,
+    /// When given, the ancestor's entry instance of `state` must have this `seq`.
+    #[serde(default)]
+    pub seq: Option<i64>,
+}
+
+fn default_region() -> String {
+    DEFAULT_REGION.to_string()
 }
 
 #[derive(Debug, Deserialize)]

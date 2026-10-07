@@ -17,6 +17,14 @@ pub enum AppError {
 pub const EVENT_IDENTITY_CONFLICT: &str = "EVENT_IDENTITY_CONFLICT";
 /// Recovery advance refused: the child's final state is not provably from this parent instance.
 pub const UNCORRELATED_CHILD_FINAL: &str = "UNCORRELATED_CHILD_FINAL";
+/// Targeted delivery: the path or entry instance is not the current active one.
+pub const TARGET_NOT_ACTIVE: &str = "TARGET_NOT_ACTIVE";
+/// Event for a managed child instance that has completed or been cancelled.
+pub const INSTANCE_NOT_ACTIVE: &str = "INSTANCE_NOT_ACTIVE";
+/// A managed child start would reuse an existing entity (re-entry or id collision).
+pub const INSTANCE_CONFLICT: &str = "INSTANCE_CONFLICT";
+/// A managed child start beyond `MAX_MANAGED_DEPTH`.
+pub const NESTING_DEPTH_EXCEEDED: &str = "NESTING_DEPTH_EXCEEDED";
 
 impl AppError {
     /// Machine-readable error code for the plugin-runtime to branch on.

@@ -138,6 +138,12 @@ async fn migrate(conn: &Connection) -> Result<(), libsql::Error> {
         .execute("ALTER TABLE entities ADD COLUMN region_entries TEXT", ())
         .await;
 
+    // Migration (statemachine-nested.v1): managed child instance (status, path). NULL for roots,
+    // legacy children and every existing row.
+    let _ = conn
+        .execute("ALTER TABLE entities ADD COLUMN instance TEXT", ())
+        .await;
+
     // Migration (E1/E3): semantic identity and provenance of history rows. NULL for existing
     // rows, so the partial unique index below cannot conflict with legacy data.
     let _ = conn

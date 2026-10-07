@@ -6,12 +6,12 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use crate::actions;
-use crate::engine::{self, RegionEntered};
+use crate::engine;
 use crate::errors::AppError;
-use crate::models::{ActionConfig, Entity, MachineDefinition, TransitionDef, DEFAULT_REGION};
+use crate::models::{ActionConfig, MachineDefinition, TransitionDef, DEFAULT_REGION};
 use crate::routes::entities::{load_entity_on, region_state_predicate};
 use crate::routes::now_millis;
-use crate::transition_core::{insert_history, insert_join_rows, update_entity, HistoryRow};
+use crate::transition_core::{write_entity, Ctx, Defs, PendingDispatch, WriteSpec};
 
 /// Start the background timeout scheduler.
 /// Polls every `interval` seconds for entities that have exceeded their timeout guard
@@ -101,17 +101,19 @@ pub(crate) async fn tick(
                         report.fired += 1;
                         // Network only after the commit above.
                         let ingest_token = lookup_ingest_token(db, &machine.tenant_id).await;
-                        actions::dispatch_actions(
-                            http_client,
-                            event_core_ingest_url,
-                            fired.action_configs,
-                            &machine.tenant_id,
-                            &machine.machine_id,
-                            &entity_id,
-                            &fired.from_state,
-                            &tt.to,
-                            ingest_token.as_deref(),
-                        );
+                        for p in fired.pending {
+                            actions::dispatch_actions(
+                                http_client,
+                                event_core_ingest_url,
+                                p.actions,
+                                &machine.tenant_id,
+                                &p.machine_id,
+                                &p.entity_id,
+                                &p.from_state,
+                                &p.to_state,
+                                ingest_token.as_deref(),
+                            );
+                        }
                         info!(
                             "Timeout transition: {}/{} {}:{} → {} (after {}s)",
                             machine.machine_id,
@@ -171,7 +173,9 @@ async fn timeout_candidates(
         "current_state = ?4".to_string()
     };
     let sql = format!(
-        "SELECT entity_id FROM entities WHERE tenant_id = ?1 AND machine_id = ?2 AND {} AND COALESCE(\
+        "SELECT entity_id FROM entities WHERE tenant_id = ?1 AND machine_id = ?2 AND {} \
+            AND (CASE WHEN json_valid(entities.instance) THEN json_extract(entities.instance, '$.status') = 'active' ELSE 1 END) \
+            AND COALESCE(\
             CASE WHEN json_valid(entities.region_entries) THEN \
               CASE WHEN json_extract(entities.region_entries, '$.version') = entities.state_version \
               THEN (SELECT json_extract(re.value, '$.entered_at') FROM json_each(entities.region_entries, '$.regions') AS re \
@@ -204,7 +208,8 @@ async fn timeout_candidates(
 
 struct FiredTimeout {
     from_state: String,
-    action_configs: Vec<(String, ActionConfig, Option<String>)>,
+    /// Every committed write of the timeout's transaction (the timeout, then any cascade).
+    pending: Vec<PendingDispatch>,
 }
 
 /// Fire one `$timeout` atomically, or return `None` when it is no longer due (state changed,
@@ -228,6 +233,10 @@ async fn fire_timeout(
         Err(AppError::NotFound(_)) => return Ok(None),
         Err(e) => return Err(e),
     };
+    // An ended managed instance (completed or cancelled) never fires.
+    if entity.instance.as_ref().is_some_and(|i| !i.is_active()) {
+        return Ok(None);
+    }
 
     let mut state_map = entity.state_map();
     let from_state = match state_map.get(region) {
@@ -252,15 +261,11 @@ async fn fire_timeout(
     } else {
         Vec::new()
     };
-    let new_state_encoded = Entity::encode_state(&state_map);
-    let version = entity.state_version + 1;
 
     // Collect actions (fired by the caller after commit; join actions stay undispatched on this path)
     let region_opt = if is_parallel { Some(region) } else { None };
     let action_configs: Vec<(String, ActionConfig, Option<String>)> =
         actions::collect_actions_for_state(&machine.actions, &tt.to, region_opt);
-    let dispatched_json =
-        serde_json::to_string(&actions::build_action_list(action_configs.clone()))?;
 
     let cause = serde_json::json!({
         "kind": "timeout",
@@ -272,68 +277,42 @@ async fn fire_timeout(
         "due_at": entry.entered_at.saturating_add(timeout_ms),
     });
 
-    // Record transition history (event_params keeps the legacy context snapshot)
-    let row = insert_history(
-        &tx,
-        &machine.tenant_id,
-        &machine.machine_id,
-        entity_id,
-        HistoryRow {
+    // One write (history, joins, state, region entries) plus, for a managed child, its
+    // completion cascade to the parents, all in this transaction.
+    let mut ctx = Ctx::new(&tx, Defs::Tx, &machine.tenant_id, "$timeout", now);
+    let written = write_entity(
+        &mut ctx,
+        machine,
+        &entity,
+        WriteSpec {
+            event_type: "$timeout",
             from_state: &from_state,
             to_state: &tt.to,
-            event_type: "$timeout",
+            region,
+            row_region: if is_parallel { region } else { "" },
+            // event_params keeps the legacy context snapshot
             event_params: serde_json::to_string(&entity.context)?,
-            actions_dispatched: dispatched_json,
-            region: if is_parallel { region } else { "" },
             timestamp: now,
-            now,
-            identity_key: &key,
+            identity_key: key,
             cause: Some(cause),
+            new_state_map: &state_map,
+            joins_fired: &joins_fired,
+            context_json: None,
+            actions: action_configs,
         },
     )
     .await;
-    let row = match row {
-        Ok(row) => row,
-        // This instance's timeout is already committed (another tick or process won).
+    match written {
+        Ok(_) => {}
+        // Another tick, process or transition won this instance.
         Err(AppError::Conflict(_)) => return Ok(None),
         Err(e) => return Err(e),
-    };
-    let mut entered = vec![RegionEntered {
-        region: region.to_string(),
-        state: tt.to.clone(),
-        row,
-        key: key.clone(),
-    }];
-    entered.extend(
-        insert_join_rows(
-            &tx, &machine.tenant_id, &machine.machine_id, entity_id,
-            &joins_fired, version, &key, now, now,
-        )
-        .await?,
-    );
-
-    // Optimistic locking: only transition if version matches
-    let new_entries = engine::advance_region_entries(&entries, &state_map, &entered, version, now);
-    match update_entity(
-        &tx,
-        &machine.tenant_id,
-        &machine.machine_id,
-        entity_id,
-        &new_state_encoded,
-        None,
-        &new_entries,
-        entity.state_version,
-        now,
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(AppError::Conflict(_)) => return Ok(None), // Another transition won the race
-        Err(e) => return Err(e),
     }
+    let pending = std::mem::take(&mut ctx.pending);
+    drop(ctx);
 
     tx.commit().await?;
-    Ok(Some(FiredTimeout { from_state, action_configs }))
+    Ok(Some(FiredTimeout { from_state, pending }))
 }
 
 /// Look up an ingest token for a tenant from the DB.

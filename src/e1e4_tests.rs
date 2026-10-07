@@ -20,21 +20,21 @@ use crate::models::*;
 use crate::routes::{self, AppState};
 use crate::scheduler;
 
-struct Fixture {
-    state: AppState,
-    db_path: PathBuf,
-    hits: Arc<AtomicUsize>,
-    sink: String,
+pub(crate) struct Fixture {
+    pub(crate) state: AppState,
+    pub(crate) db_path: PathBuf,
+    pub(crate) hits: Arc<AtomicUsize>,
+    pub(crate) sink: String,
 }
 
-async fn fixture() -> Fixture {
+pub(crate) async fn fixture() -> Fixture {
     let dir = std::env::temp_dir().join(format!("sm-e1e4-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = dir.join("sm.db");
     fixture_at(db_path).await
 }
 
-async fn fixture_at(db_path: PathBuf) -> Fixture {
+pub(crate) async fn fixture_at(db_path: PathBuf) -> Fixture {
     let database = db::init(db_path.to_str().unwrap(), "").await.unwrap();
 
     let hits = Arc::new(AtomicUsize::new(0));
@@ -66,20 +66,20 @@ async fn fixture_at(db_path: PathBuf) -> Fixture {
     Fixture { state, db_path, hits, sink }
 }
 
-fn headers(tenant: &str) -> HeaderMap {
+pub(crate) fn headers(tenant: &str) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert("x-tenant-id", tenant.parse().unwrap());
     h
 }
 
-async fn mk_machine(fx: &Fixture, tenant: &str, def: serde_json::Value) -> Result<(), AppError> {
+pub(crate) async fn mk_machine(fx: &Fixture, tenant: &str, def: serde_json::Value) -> Result<(), AppError> {
     let req: CreateMachineRequest = serde_json::from_value(def).unwrap();
     routes::machines::create_machine(State(fx.state.clone()), headers(tenant), Json(req))
         .await
         .map(|_| ())
 }
 
-async fn mk_entity(fx: &Fixture, tenant: &str, machine: &str, entity: &str) {
+pub(crate) async fn mk_entity(fx: &Fixture, tenant: &str, machine: &str, entity: &str) {
     let req: CreateEntityRequest = serde_json::from_value(json!({ "entity_id": entity })).unwrap();
     routes::entities::create_entity(State(fx.state.clone()), headers(tenant), Path(machine.to_string()), Json(req))
         .await
@@ -88,7 +88,7 @@ async fn mk_entity(fx: &Fixture, tenant: &str, machine: &str, entity: &str) {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn eval(
+pub(crate) async fn eval(
     fx: &Fixture,
     tenant: &str,
     machine: &str,
@@ -113,11 +113,11 @@ async fn eval(
         .map(|j| j.0)
 }
 
-async fn entity(fx: &Fixture, tenant: &str, machine: &str, entity: &str) -> Result<Entity, AppError> {
+pub(crate) async fn entity(fx: &Fixture, tenant: &str, machine: &str, entity: &str) -> Result<Entity, AppError> {
     routes::entities::load_entity(&fx.state, tenant, machine, entity).await
 }
 
-async fn history(fx: &Fixture, tenant: &str, machine: &str, entity: &str) -> Vec<TransitionRecord> {
+pub(crate) async fn history(fx: &Fixture, tenant: &str, machine: &str, entity: &str) -> Vec<TransitionRecord> {
     routes::transitions::get_history(
         State(fx.state.clone()),
         headers(tenant),
@@ -128,16 +128,16 @@ async fn history(fx: &Fixture, tenant: &str, machine: &str, entity: &str) -> Vec
     .0
 }
 
-async fn sql(fx: &Fixture, statement: &str) {
+pub(crate) async fn sql(fx: &Fixture, statement: &str) {
     fx.state.db.connect().unwrap().execute_batch(statement).await.unwrap();
 }
 
-async fn tick(fx: &Fixture, now: i64) -> scheduler::TickReport {
+pub(crate) async fn tick(fx: &Fixture, now: i64) -> scheduler::TickReport {
     scheduler::tick(&fx.state.db, &fx.state.http_client, &fx.sink, now).await.unwrap()
 }
 
 /// Wait up to 2 s for the sink to reach `n` hits; return the final count after a settle delay.
-async fn sink_hits(fx: &Fixture, n: usize) -> usize {
+pub(crate) async fn sink_hits(fx: &Fixture, n: usize) -> usize {
     for _ in 0..40 {
         if fx.hits.load(Ordering::SeqCst) >= n {
             break;
@@ -148,15 +148,15 @@ async fn sink_hits(fx: &Fixture, n: usize) -> usize {
     fx.hits.load(Ordering::SeqCst)
 }
 
-fn entries(e: &Entity) -> std::collections::BTreeMap<String, RegionEntry> {
+pub(crate) fn entries(e: &Entity) -> std::collections::BTreeMap<String, RegionEntry> {
     engine::effective_region_entries(e)
 }
 
-fn is_rejected(r: &Result<TransitionResponse, AppError>, code: &str) -> bool {
+pub(crate) fn is_rejected(r: &Result<TransitionResponse, AppError>, code: &str) -> bool {
     matches!(r, Err(AppError::Rejected { code: c, .. }) if *c == code)
 }
 
-const T: &str = "e1e4-test";
+pub(crate) const T: &str = "e1e4-test";
 
 // ── E1: atomic writes, no effect before a failed commit ─────────────────────
 

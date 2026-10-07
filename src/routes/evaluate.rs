@@ -27,10 +27,16 @@ pub async fn evaluate(
     load_or_create_entity(&state, &tenant_id, &machine_id, &entity_id, &machine).await?;
     let timestamp = req.timestamp.unwrap_or_else(now_millis);
 
-    let resp = transition_core::execute_transition(
-        &state, &tenant_id, &machine, &entity_id, &req.event_type, &req.params, timestamp, req.dispatch,
-    )
-    .await?;
+    let resp = match &req.target {
+        Some(target) => transition_core::execute_targeted(
+            &state, &tenant_id, &machine, &entity_id, target, &req.event_type, &req.params, timestamp, req.dispatch,
+        )
+        .await?,
+        None => transition_core::execute_transition(
+            &state, &tenant_id, &machine, &entity_id, &req.event_type, &req.params, timestamp, req.dispatch,
+        )
+        .await?,
+    };
 
     Ok(Json(resp))
 }
@@ -102,9 +108,15 @@ pub async fn evaluate_batch(
 
             let timestamp = event.timestamp.unwrap_or_else(now_millis);
 
-            match transition_core::execute_transition(
-                &state, &tenant_id, &machine, &entity_id, &event.event_type, &event.params, timestamp, event.dispatch,
-            ).await {
+            let outcome = match &event.target {
+                Some(target) => transition_core::execute_targeted(
+                    &state, &tenant_id, &machine, &entity_id, target, &event.event_type, &event.params, timestamp, event.dispatch,
+                ).await,
+                None => transition_core::execute_transition(
+                    &state, &tenant_id, &machine, &entity_id, &event.event_type, &event.params, timestamp, event.dispatch,
+                ).await,
+            };
+            match outcome {
                 Ok(resp) => BatchEventResult {
                     entity_id: Some(resp.entity_id.clone()),
                     result: Some(resp),
@@ -177,6 +189,11 @@ async fn load_or_create_entity(
 ) -> Result<Entity, AppError> {
     match load_entity(state, tenant_id, machine_id, entity_id).await {
         Ok(entity) => Ok(entity),
+        Err(AppError::NotFound(_)) if machine.has_managed_initial() => {
+            // A root starting in a managed compound state starts its children in the same transaction.
+            transition_core::create_root_with_children(state, tenant_id, machine, entity_id, "{}", true).await?;
+            load_entity(state, tenant_id, machine_id, entity_id).await
+        }
         Err(AppError::NotFound(_)) => {
             let now = now_millis();
             let initial_state_map = machine.initial_state_map();

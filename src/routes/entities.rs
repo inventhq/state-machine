@@ -9,6 +9,7 @@ use crate::errors::AppError;
 use crate::models::*;
 use crate::routes::machines::load_machine;
 use crate::routes::{extract_tenant_id, now_millis, AppState};
+use crate::transition_core;
 
 /// POST /api/machines/:machine_id/entities — create entity in initial state
 pub async fn create_entity(
@@ -26,6 +27,14 @@ pub async fn create_entity(
 
     let context = req.context.unwrap_or_default();
     let context_json = serde_json::to_string(&context)?;
+
+    // A root starting in a managed compound state starts its children in the same transaction.
+    if machine.has_managed_initial() {
+        transition_core::create_root_with_children(&state, &tenant_id, &machine, &req.entity_id, &context_json, false).await?;
+        let entity = load_entity(&state, &tenant_id, &machine_id, &req.entity_id).await?;
+        return Ok((StatusCode::CREATED, Json(entity.to_response())));
+    }
+
     let now = now_millis();
 
     // Build initial state from machine definition (flat string or JSON map)
@@ -65,6 +74,7 @@ pub async fn create_entity(
         created_at: now,
         updated_at: now,
         region_entries: Some(region_entries),
+        instance: None,
     };
 
     Ok((StatusCode::CREATED, Json(entity.to_response())))
@@ -166,7 +176,7 @@ pub async fn delete_entity(
 
 /// Entity columns in the order `row_to_entity` reads them.
 pub const ENTITY_COLUMNS: &str =
-    "machine_id, tenant_id, entity_id, current_state, context, state_version, created_at, updated_at, region_entries";
+    "machine_id, tenant_id, entity_id, current_state, context, state_version, created_at, updated_at, region_entries, instance";
 
 /// SQL predicate: the JSON-object state in `state_column` has key `?{region_idx}` equal to
 /// `?{state_idx}`. Both are bound parameters; a non-JSON (flat) state never matches.
@@ -226,6 +236,11 @@ fn row_to_entity(row: &libsql::Row) -> Result<Entity, AppError> {
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str::<StoredRegionEntries>(&s).ok());
+    let instance = row
+        .get::<Option<String>>(9)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<ChildInstance>(&s).ok());
 
     Ok(Entity {
         machine_id: row.get(0)?,
@@ -237,5 +252,6 @@ fn row_to_entity(row: &libsql::Row) -> Result<Entity, AppError> {
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
         region_entries,
+        instance,
     })
 }

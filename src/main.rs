@@ -19,6 +19,8 @@ mod transition_core;
 
 #[cfg(test)]
 mod e1e4_tests;
+#[cfg(test)]
+mod nested_tests;
 
 use routes::AppState;
 

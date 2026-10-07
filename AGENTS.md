@@ -109,6 +109,18 @@ If `affected == 0`, another transition won the race → return `409 Conflict`.
 Every writer runs in a `BEGIN IMMEDIATE` transaction (E1), so this guard is not expected to
 trip; contention surfaces as `500 database is locked` with nothing applied.
 
+### Managed Nested Children (statemachine-nested.v1)
+
+See `docs/NESTED_CONTRACT.md`. `SubMachineDef.lifecycle = "managed"` (opt-in; legacy is the
+default and unchanged) gives a compound state an eager, create-only child
+(`{parent}::sub::{state}`, with `entities.instance` = status/depth/path), atomic completion
+cascades on every path (`on_final` for flat children, `complete_when` naming every region for
+parallel children; the scheduler included), and subtree cancellation whenever the parent leaves
+the compound state. `evaluate.target` delivers to exactly one managed instance with no
+forwarding. All of it runs inside the one transaction of `write_entity` in `transition_core.rs`
+(`start_child`, `cancel_subtree`, `complete_parent`). Re-entry of a managed compound state is
+refused (`INSTANCE_CONFLICT`); depth is bounded by `MAX_MANAGED_DEPTH` (8).
+
 ### Region Entry Instances and Identity (E1–E4)
 
 See `docs/E1_E4_CONTRACT.md` (`statemachine-e1e4.v1`). `entities.region_entries` records each
@@ -180,6 +192,11 @@ Original engine tests (9):
 - `test_join_fires_when_all_satisfied` — join barrier fires
 - `test_join_not_satisfied` — join doesn't fire when conditions not met
 - `test_join_does_not_refire` — join idempotency
+
+Nested tests (8, `nested_tests.rs`): depth-3 completion cascade through a parallel child with one
+definition reused for two sibling branches, timeout cascade across restart, selected-branch
+cancellation (late events/timers inert), event-vs-timer race with one winner, re-entry refusal,
+depth/cycle bounds, whole-cascade rollback, definition and target validation.
 
 E1–E4 tests (28): 9 pure helper tests in `engine.rs` (identity keys, params equality, entry
 instances, legacy derivation, region validation) and 19 DB-backed tests in `e1e4_tests.rs`
