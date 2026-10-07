@@ -348,15 +348,53 @@ async fn nested_completion_race_has_one_durable_winner() {
             crate::scheduler::tick(&f2.state.db, &f2.state.http_client, &f2.sink, due).await.map_err(|e| e.to_string())
         });
         let (ev, tk) = (ev.await.unwrap(), tk.await.unwrap());
-        // Finish whichever lost to a lock (never a second completion).
-        tick(&fx, due).await;
-        let _ = eval_t(&fx, "main", &root, "approve", 12, path_b(1, 3)).await;
+        eprintln!("race {}: initial event={:?} tick={:?}", i,
+            ev.as_ref().map(|r| (r.transition.clone(), r.reason.clone())).map_err(|e| e.to_string()), tk);
+
+        // Initial outcomes: only the documented winners and losers are accepted.
+        let event_applied = match &ev {
+            Ok(r) if r.transition.as_deref() == Some("working → done") => true,
+            Ok(r) if r.transition.is_none() && r.reason.as_deref().is_some_and(|m| m.starts_with("no transition")) => false,
+            Err(AppError::Internal(m)) if m.contains("database is locked") => false,
+            Err(AppError::Rejected { code, .. }) if *code == TARGET_NOT_ACTIVE => false,
+            other => panic!(
+                "race {}: unexpected event outcome {:?}",
+                i,
+                other.as_ref().map(|r| (r.transition.clone(), r.reason.clone())).map_err(|e| e.to_string())
+            ),
+        };
+        let tick_fired = match &tk {
+            Ok(report) => {
+                assert!(report.fired <= 1, "race {}: {:?}", i, report);
+                report.fired == 1
+            }
+            Err(m) => {
+                assert!(m.contains("database is locked"), "race {}: unexpected tick error {}", i, m);
+                false
+            }
+        };
+        assert!(!(event_applied && tick_fired), "race {}: both the event and the timer applied", i);
+
+        // Finish whichever lost to a lock, sequentially. The follow-up tick must run clean (a
+        // per-candidate error is counted, not typed; a non-transient one would recur here).
+        let follow = tick(&fx, due).await;
+        assert_eq!(follow.errors, 0, "race {}: follow-up tick {:?}", i, follow);
+        assert_eq!(follow.fired == 1, !event_applied && !tick_fired, "race {}: follow-up tick {:?}", i, follow);
+        let retry = eval_t(&fx, "main", &root, "approve", 12, path_b(1, 3)).await;
+        if event_applied {
+            let r = retry.unwrap();
+            assert_eq!(r.reason.as_deref(), Some("duplicate event (already processed)"), "race {}", i);
+        } else {
+            assert!(is_rejected(&retry, TARGET_NOT_ACTIVE), "race {}: retry {:?}", i,
+                retry.as_ref().map(|r| (r.transition.clone(), r.reason.clone())).map_err(|e| e.to_string()));
+        }
+
         let completes = history(&fx, T, "settle", &settle_c).await.iter().filter(|h| h.event_type == "$sub_complete").count();
         let root_e = entity(&fx, T, "main", &root).await.unwrap();
-        eprintln!("race {}: event={:?} tick={:?} -> b1={} settle completions={}", i,
-            ev.as_ref().map(|r| r.transition.clone()).map_err(|e| e.to_string()), tk, root_e.state_map()["b1"], completes);
+        eprintln!("race {}: winner={} -> b1={} settle completions={}", i,
+            if event_applied { "event" } else { "timer" }, root_e.state_map()["b1"], completes);
         assert_eq!(completes, 1);
-        assert!(["returned", "kept"].contains(&root_e.state_map()["b1"].as_str()));
+        assert_eq!(root_e.state_map()["b1"], if event_applied { "returned" } else { "kept" });
         assert_eq!(history(&fx, T, "main", &root).await.iter().filter(|h| h.event_type == "$sub_complete").count(), 1);
     }
 }
