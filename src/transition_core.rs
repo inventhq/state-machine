@@ -537,7 +537,7 @@ async fn transition_in_tx(
 }
 
 /// Actions for entering `to_state` plus every fired join's target state and join actions.
-fn collect_write_actions(
+pub(crate) fn collect_write_actions(
     machine: &MachineDefinition,
     to_state: &str,
     display_region: Option<&str>,

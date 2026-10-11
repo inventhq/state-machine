@@ -14,11 +14,14 @@ mod errors;
 mod models;
 mod routes;
 mod ingest_tokens;
+mod memory;
 mod scheduler;
 mod transition_core;
 
 #[cfg(test)]
 mod e1e4_tests;
+#[cfg(test)]
+mod memory_tests;
 #[cfg(test)]
 mod nested_tests;
 
@@ -51,6 +54,25 @@ async fn main() {
         .unwrap_or(10);
 
     info!("Starting state-machine on {}", listen_addr);
+
+    // STATE_STORE=memory: no database at all; machines, entities and history live in this process (memory.rs).
+    if std::env::var("STATE_STORE").as_deref() == Ok("memory") {
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("Failed to create HTTP client");
+        let app = memory::router(api_key, http_client, event_core_ingest_url, timeout_interval_secs)
+            .route("/health", get(handle_health));
+        let listener = tokio::net::TcpListener::bind(&listen_addr)
+            .await
+            .expect("Failed to bind to address");
+        info!("state-machine listening on {} (memory store)", listen_addr);
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .expect("Server error");
+        return;
+    }
 
     let database = db::init(&turso_url, &turso_token)
         .await
